@@ -13,7 +13,7 @@ RUN apt-get update -y && apt-get install -y \
   python-dev \
   python-pip
 
-ADD ibis/requirements.txt /requirements.txt
+ADD ../requirements.txt /requirements.txt
 
 RUN pip install pip --upgrade
 RUN pip install setuptools --upgrade

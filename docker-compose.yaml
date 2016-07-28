@@ -8,3 +8,10 @@ services:
     build: ./impala
     links:
       - "db:postgres"
+
+  ibis:
+    build: ./ibis-docker
+    links:
+      - "db:postgres"
+      - "impala:impala"
+      - "impala:hdfs"
