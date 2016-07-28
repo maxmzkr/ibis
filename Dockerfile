@@ -13,11 +13,15 @@ RUN apt-get update -y && apt-get install -y \
   python-dev \
   python-pip
 
-ADD ../requirements.txt /requirements.txt
+ADD ./requirements.txt /requirements.txt
 
 RUN pip install pip --upgrade
 RUN pip install setuptools --upgrade
 
 RUN pip install -r /requirements.txt
 
-CMD /bin/bash
+RUN pip install click
+
+ENV PYTHONPATH=/ibis
+
+CMD tail -f /dev/null

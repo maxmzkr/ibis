@@ -41,4 +41,6 @@ COPY hive-site.xml /etc/impala/conf/hive-site.xml
 
 COPY init /init
 
+EXPOSE 50070:5070
+
 CMD /init

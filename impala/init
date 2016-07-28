@@ -29,6 +29,9 @@ fi
 
 echo "postgres is ready"
 
+createdb -U postgres -h postgres metastore
+cd /usr/lib/hive/scripts/metastore/upgrade/postgres && \
+  psql -U postgres -h postgres -d metastore -t -c '\i hive-schema-1.1.0.postgres.sql'
 
 sudo service hadoop-hdfs-namenode start
 sudo service hadoop-hdfs-datanode start

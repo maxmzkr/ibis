@@ -10,8 +10,15 @@ services:
       - "db:postgres"
 
   ibis:
-    build: ./ibis-docker
+    build: ./
     links:
       - "db:postgres"
       - "impala:impala"
       - "impala:hdfs"
+    volumes:
+      - ./ibis:/ibis/ibis
+      - ./scripts:/ibis/scripts
+      - ./testing:/ibis/testing
+    environment:
+      - IBIS_TEST_IMPALA_HOST=impala
+      - IBIS_TEST_NN_HOST=hdfs
