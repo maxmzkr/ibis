@@ -1009,6 +1009,7 @@ class TestDDLE2E(ImpalaE2E, unittest.TestCase):
     def test_create_table_reserved_identifier(self):
         table_name = 'distinct'
         expr = self.con.table('functional_alltypes')
+        print self.con
         self.con.create_table(table_name, expr)
         self.temp_tables.append(table_name)
 
@@ -1130,3 +1131,9 @@ def _assert_table_not_exists(con, table_name, database=None):
 def _ensure_drop(con, table_name, database=None):
     con.drop_table(table_name, database=database, force=True)
     _assert_table_not_exists(con, table_name, database=database)
+
+if __name__ == "__main__":
+    TestDDLE2E.setUpClass()
+    cls = TestDDLE2E()
+    cls.test_truncate_table()
+

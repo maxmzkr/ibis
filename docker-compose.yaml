@@ -1,0 +1,10 @@
+version: '2'
+
+services:
+  db:
+    image: postgres:9.3
+
+  impala:
+    build: ./impala
+    links:
+      - "db:postgres"

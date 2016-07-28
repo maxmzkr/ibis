@@ -1,0 +1,40 @@
+#!/bin/bash
+
+export HADOOP_CLASSPATH=$HADOOP_CLASSPATH:/usr/share/java/slf4j-simple.jar
+
+base=1
+backoff=1.5
+attempts=10
+ready=0
+for i in `seq 1 ${attempts}`;
+do
+  readyOut=`pg_isready -U postgres -h postgres`
+  expectedReadyOut='postgres:5432 - accepting connections'
+  if [[ "${readyOut}" == "${expectedReadyOut}" ]]
+  then
+    ready=1
+    break
+  fi
+  echo "postgres not ready: output: ${readyOut}"
+  echo "sleeping for ${base} seconds"
+  sleep "${base}"
+  base=`echo "${base} * ${backoff}" | bc`
+done
+
+if [[ "${ready}" == 0 ]]
+then
+  echo "postgres never was ready"
+  return -1
+fi
+
+echo "postgres is ready"
+
+
+sudo service hadoop-hdfs-namenode start
+sudo service hadoop-hdfs-datanode start
+sudo service hive-metastore start
+sudo service impala-state-store start
+sudo service impala-catalog start
+sudo service impala-server start
+
+tail -f /dev/null

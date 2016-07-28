@@ -52,7 +52,7 @@ def make_ibis_client():
     hc = ibis.hdfs_connect(host=ENV.nn_host, port=ENV.webhdfs_port,
                            auth_mechanism=ENV.auth_mechanism,
                            verify=(ENV.auth_mechanism
-                                   not in ['GSSAPI', 'LDAP']))
+                                   not in ['GSSAPI', 'LDAP']), user='hdfs')
     if ENV.auth_mechanism in ['GSSAPI', 'LDAP']:
         print("Warning: ignoring invalid Certificate Authority errors")
     return ibis.impala.connect(host=ENV.impala_host, port=ENV.impala_port,
@@ -68,6 +68,8 @@ def can_write_to_hdfs(con):
         con.hdfs.rm(test_path)
         return True
     except:
+        import traceback
+        traceback.print_exc()
         return False
 
 

@@ -76,7 +76,8 @@ def connect_test(env, with_hdfs=True):
                                         port=env.webhdfs_port,
                                         auth_mechanism=env.auth_mechanism,
                                         verify=(env.auth_mechanism
-                                                not in ['GSSAPI', 'LDAP']))
+                                                not in ['GSSAPI', 'LDAP']),
+                                        user='hdfs')
     else:
         hdfs_client = None
 
@@ -85,7 +86,8 @@ def connect_test(env, with_hdfs=True):
                                port=env.impala_port,
                                auth_mechanism=env.auth_mechanism,
                                pool_size=2,
-                               hdfs_client=hdfs_client)
+                               hdfs_client=hdfs_client,
+                               user='impala')
 
 
 @pytest.mark.impala
@@ -129,6 +131,7 @@ class ImpalaE2E(object):
 
         if not cls.hdfs.exists(cls.tmp_dir):
             cls.hdfs.mkdir(cls.tmp_dir)
+        print str(cls.env)
         cls.hdfs.chmod(cls.tmp_dir, '777')
 
     @staticmethod
