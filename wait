@@ -1,0 +1,68 @@
+#!/bin/bash
+base=1
+backoff=1.5
+attempts=10
+ready=0
+
+function show_help() {
+  echo 'Usage: wait.sh [-h] [-b base] [-o backoof] [-a attempts] command expected_output'
+  echo ''
+  echo '-h Show this help menu.'
+  echo '-b Set the first amount of time to wait, in seconds, if command doesn'"'"'t'
+  echo '   return the expected value. If the value is 1, and the command doesn'"'"'t'
+  echo '   return the expected value, then there will be a 1 second wait before trying'
+  echo '   again'
+  echo '-o Set the backoff multiplier. If the base is 1 and the multiplier is 1.5, the'
+  echo '   first time the command doesn'"'"'t return the expected value there will'
+  echo '   be a 1 second wait. The second time, there will be a 1.5 second wait.'
+  echo '-a Set the maximum number of attempts to make before failing.'
+}
+
+while getopts "h?b:o:a:" opt; do
+  case "${opt}" in
+  h|\?)
+    show_help
+    exit 0
+    ;;
+  b) base="${OPTARG}"
+    ;;
+  o) backoff="${OPTARG}"
+    ;;
+  a) attempts="${OPTARG}"
+    ;;
+  esac
+done
+shift $(expr $OPTIND - 1 )
+
+if [[ -z "${1+x}" ]] || [[ -z "${2+x}" ]]; then
+  echo 'You must set the the command to run and the expected output'
+  echo ''
+  show_help
+  exit 1
+fi
+
+run_command="${1}"
+expected_output="${2}"
+
+break=false
+for i in `seq '1' "${attempts}"`; do
+  output=`eval ${run_command}`
+  if [[ "${output}" == "${expected_output}" ]]; then
+    exit 0
+  fi
+
+  echo 'attempt: '"'${i}'"
+  echo "${run_command}"
+  echo "${output}"
+  echo 'output was not the expected output'
+  echo "${expected_output}"
+  if [[ "${i}" -ge "${attempts}" ]]; then
+    echo 'reached max number attempts, giving up'
+    exit 1
+  fi
+  echo 'sleeping for '"${base}"' seconds'
+  sleep "${base}"
+  base=`echo "${base} * ${backoff}" | bc`
+done
+
+exit 1

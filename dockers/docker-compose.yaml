@@ -1,0 +1,25 @@
+version: '2'
+
+services:
+  db:
+    image: postgres:9.3
+
+  impala:
+    build: ./impala
+    links:
+      - "db:postgres"
+
+  ibis:
+    build: ./ibis
+    links:
+      - "db:postgres"
+      - "impala:impala"
+      - "impala:hdfs"
+    volumes:
+      - ../ibis:/ibis/ibis
+      - ../scripts:/ibis/scripts
+      - ../testing:/ibis/testing
+    environment:
+      - IBIS_TEST_IMPALA_HOST=impala
+      - IBIS_TEST_NN_HOST=hdfs
+      - IBIS_TEST_WEBHDFS_PORT=50070

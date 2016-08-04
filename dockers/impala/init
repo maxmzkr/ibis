@@ -1,0 +1,35 @@
+#!/bin/bash
+
+export HADOOP_CLASSPATH=$HADOOP_CLASSPATH:/usr/share/java/slf4j-simple.jar
+
+
+/bin/bash '/wait' 'pg_isready -U postgres -h postgres' 'postgres:5432 - accepting connections'
+if [[ "${?}" == 1 ]]
+then
+  echo 'postgres never was ready'
+  exit 1
+fi
+
+echo 'postgres is ready'
+
+createdb -U postgres -h postgres metastore
+cd /usr/lib/hive/scripts/metastore/upgrade/postgres && \
+  psql -U postgres -h postgres -d metastore -t -c '\i hive-schema-1.1.0.postgres.sql'
+
+sudo service hadoop-hdfs-namenode start
+sudo service hadoop-hdfs-datanode start
+sudo service hive-metastore start
+
+/bin/bash '/wait' 'hive -e '"'"'select 1'"'" '1'
+if [[ "${?}" == 1 ]]; then
+  echo 'hive never was ready'
+  exit 1
+fi
+
+echo 'hive is ready'
+
+sudo service impala-state-store start
+sudo service impala-catalog start
+sudo service impala-server start
+
+tail -f /dev/null
