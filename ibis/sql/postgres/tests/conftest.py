@@ -12,4 +12,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ibis.tests.conftest import *  # noqa
+import getpass
+import os
+
+import pytest
+
+import ibis
+
+PG_USER = os.environ.get(
+    'IBIS_POSTGRES_USER',
+    os.environ.get('PGUSER', getpass.getuser())
+)
+PG_PASS = os.environ.get('IBIS_POSTGRES_PASS', os.environ.get('PGPASSWORD'))
+PG_HOST = os.environ.get('PGHOST', 'localhost')
+IBIS_TEST_POSTGRES_DB = os.environ.get(
+    'IBIS_TEST_POSTGRES_DB',
+    os.environ.get('PGDATABASE', 'ibis_testing')
+)
+
+
+@pytest.fixture(scope='module')
+def con():
+    return ibis.postgres.connect(
+        host=PG_HOST,
+        user=PG_USER,
+        password=PG_PASS,
+        database=IBIS_TEST_POSTGRES_DB,
+    )
+
+
+@pytest.fixture(scope='module')
+def db(con):
+    return con.database()
+
+
+@pytest.fixture(scope='module')
+def alltypes(db):
+    return db.functional_alltypes
+
+
+@pytest.fixture(scope='module')
+def df(alltypes):
+    return alltypes.execute()
+
+
+@pytest.fixture(scope='module')
+def at(alltypes):
+    return alltypes.op().sqla_table
+
+
+@pytest.fixture
+def translate():
+    from ibis.sql.postgres.compiler import PostgreSQLExprTranslator
+    return lambda expr: PostgreSQLExprTranslator(expr).get_result()

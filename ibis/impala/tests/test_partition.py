@@ -12,18 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import unittest
+
 from posixpath import join as pjoin
+
 import pytest
 
-from pandas.util.testing import assert_frame_equal
-import pandas as pd
+pytest.importorskip('hdfs')
+pytest.importorskip('sqlalchemy')
+pytest.importorskip('impala.dbapi')
 
-from ibis.compat import unittest
-from ibis.impala.compat import ImpylaError
-from ibis.impala.tests.common import ImpalaE2E, ENV
-from ibis.tests.util import assert_equal
-import ibis
-import ibis.util as util
+import impala  # noqa: E402
+
+from pandas.util.testing import assert_frame_equal  # noqa: E402
+import pandas as pd  # noqa: E402
+
+from ibis.impala.compat import ImpylaError  # noqa: E402
+from ibis.impala.tests.common import ImpalaE2E, ENV  # noqa: E402
+from ibis.tests.util import assert_equal  # noqa: E402
+import ibis  # noqa: E402
+import ibis.util as util  # noqa: E402
 
 
 def _tmp_name():
@@ -130,40 +138,31 @@ class TestPartitioning(ImpalaE2E, unittest.TestCase):
 
         self._verify_partitioned_table(part_t, df, unique_keys)
 
-    def test_insert_select_partitionless_expr(self):
-        df = self.df
+    def test_create_partitioned_table_from_expr(self):
+        t = self.con.table('functional_alltypes')
+        expr = t[t.id <= 10][['id', 'double_col', 'month', 'year']]
+        name = 'tmppart_{}'.format(util.guid())
+        try:
+            self.con.create_table(name, expr, partition=[t.year])
+        except Exception:
+            raise
+        else:
+            new = self.con.table(name)
+            expected = expr.execute().sort_values('id').reset_index(drop=True)
+            result = new.execute().sort_values('id').reset_index(drop=True)
+            assert_frame_equal(result, expected)
+        finally:
+            self.con.drop_table(name, force=True)
 
-        unpart_t = self.db.table(self.pd_name)
-        part_keys = ['year', 'month']
-
-        sel_cols = [x for x in unpart_t.columns if x not in part_keys]
-        unpart_t = unpart_t[sel_cols]
-
-        part_t = self._create_partitioned_table(unpart_t.schema(),
-                                                part_keys)
-        unique_keys = df[part_keys].drop_duplicates()
-
-        for i, (year, month) in enumerate(unique_keys.itertuples(index=False)):
-            select_stmt = unpart_t[(unpart_t.year == year) &
-                                   (unpart_t.month == month)]
-
-            # test both styles of insert
-            if i:
-                part = {'year': year, 'month': month}
-            else:
-                part = [year, month]
-            part_t.insert(select_stmt, partition=part)
-
-        self._verify_partitioned_table(part_t, df, unique_keys)
-
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_insert_overwrite_partition(self):
-        pass
+        assert False
 
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_dynamic_partitioning(self):
-        pass
+        assert False
 
-    def test_add_drop_partition(self):
-        pytest.skip('HIVE-12613')
+    def test_add_drop_partition_no_location(self):
         schema = ibis.schema([('foo', 'string'),
                               ('year', 'int32'),
                               ('month', 'int16')])
@@ -175,7 +174,61 @@ class TestPartitioning(ImpalaE2E, unittest.TestCase):
 
         part = {'year': 2007, 'month': 4}
 
-        path = '/tmp/tmp-{0}'.format(util.guid())
+        table.add_partition(part)
+
+        assert len(table.partitions()) == 2
+
+        table.drop_partition(part)
+
+        assert len(table.partitions()) == 1
+
+        table.drop()
+
+    def test_add_drop_partition_owned_by_impala(self):
+        schema = ibis.schema([('foo', 'string'),
+                              ('year', 'int32'),
+                              ('month', 'int16')])
+        name = _tmp_name()
+        self.db.create_table(name, schema=schema, partition=['year', 'month'])
+
+        table = self.db.table(name)
+
+        part = {'year': 2007, 'month': 4}
+
+        subdir = util.guid()
+        basename = util.guid()
+        path = '/tmp/{}/{}'.format(subdir, basename)
+
+        self.con.hdfs.mkdir('/tmp/{}'.format(subdir))
+        self.con.hdfs.chown(
+            '/tmp/{}'.format(subdir), owner='impala', group='supergroup'
+        )
+
+        table.add_partition(part, location=path)
+
+        assert len(table.partitions()) == 2
+
+        table.drop_partition(part)
+
+        assert len(table.partitions()) == 1
+        table.drop()
+
+    @pytest.mark.xfail(
+        raises=impala.error.HiveServer2Error, reason='HIVE-12613'
+    )
+    def test_add_drop_partition_hive_bug(self):
+        schema = ibis.schema([('foo', 'string'),
+                              ('year', 'int32'),
+                              ('month', 'int16')])
+        name = _tmp_name()
+        self.db.create_table(name, schema=schema, partition=['year', 'month'])
+
+        table = self.db.table(name)
+
+        part = {'year': 2007, 'month': 4}
+
+        path = '/tmp/{}'.format(util.guid())
+
         table.add_partition(part, location=path)
 
         assert len(table.partitions()) == 2
@@ -184,8 +237,11 @@ class TestPartitioning(ImpalaE2E, unittest.TestCase):
 
         assert len(table.partitions()) == 1
 
+        table.drop()
+
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_set_partition_location(self):
-        pass
+        assert False
 
     def test_load_data_partition(self):
         df = self.df
@@ -231,7 +287,7 @@ class TestPartitioning(ImpalaE2E, unittest.TestCase):
 
     def _verify_partitioned_table(self, part_t, df, unique_keys):
         result = (part_t.execute()
-                  .sort_index(by='id')
+                  .sort_values(by='id')
                   .reset_index(drop=True)
                   [df.columns])
 
@@ -251,8 +307,10 @@ class TestPartitioning(ImpalaE2E, unittest.TestCase):
         self.temp_tables.append(part_name)
         return self.db.table(part_name)
 
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_drop_partition(self):
-        pass
+        assert False
 
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_repartition_automated(self):
-        pass
+        assert False

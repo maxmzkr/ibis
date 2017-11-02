@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ibis.common import RelationError, ExpressionError, IbisTypeError
-from ibis.expr.datatypes import HasSchema
-from ibis.expr.window import window
+import toolz
+
 import ibis.expr.types as ir
 import ibis.expr.operations as ops
-import ibis.util as util
-import toolz
+
+from ibis.expr.datatypes import HasSchema
+from ibis.expr.window import window
+
+from ibis.common import RelationError, ExpressionError, IbisTypeError
 
 # ---------------------------------------------------------------------
 # Some expression metaprogramming / graph transformations to support
@@ -26,43 +28,69 @@ import toolz
 
 
 def sub_for(expr, substitutions):
-    mapping = dict((repr(k.op()), v) for k, v in substitutions)
-    return _subs(expr, mapping)
+    mapping = {repr(k.op()): v for k, v in substitutions}
+    substitutor = Substitutor()
+    return substitutor.substitute(expr, mapping)
 
 
 def _expr_key(expr):
     try:
-        return repr(expr.op())
-    except AttributeError:
-        return expr
+        name = expr.get_name()
+    except (AttributeError, ExpressionError):
+        name = None
 
-
-@toolz.memoize(key=lambda args, kwargs: _expr_key(args[0]))
-def _subs(expr, mapping):
-    """Substitute expressions with other expressions
-    """
-    node = expr.op()
-    key = repr(node)
-    if key in mapping:
-        return mapping[key]
-    if node.blocks():
-        return expr
-
-    new_args = list(node.args)
-    unchanged = True
-    for i, arg in enumerate(new_args):
-        if isinstance(arg, ir.Expr):
-            new_arg = _subs(arg, mapping)
-            unchanged = unchanged and new_arg is arg
-            new_args[i] = new_arg
-    if unchanged:
-        return expr
     try:
-        new_node = type(node)(*new_args)
-    except IbisTypeError:
-        return expr
+        op = expr.op()
+    except AttributeError:
+        return expr, name
+    else:
+        return repr(op), name
 
-    return expr._factory(new_node, name=getattr(expr, '_name', None))
+
+class Substitutor(object):
+
+    def __init__(self):
+        cache = toolz.memoize(key=lambda args, kwargs: _expr_key(args[0]))
+        self.substitute = cache(self._substitute)
+
+    def _substitute(self, expr, mapping):
+        """Substitute expressions with other expressions.
+
+        Parameters
+        ----------
+        expr : ibis.expr.types.Expr
+        mapping : Dict, OrderedDict
+
+        Returns
+        -------
+        new_expr : ibis.expr.types.Expr
+        """
+        node = expr.op()
+        key = repr(node)
+        if key in mapping:
+            return mapping[key]
+        if node.blocks():
+            return expr
+
+        new_args = list(node.args)
+        unchanged = True
+        for i, arg in enumerate(new_args):
+            if isinstance(arg, ir.Expr):
+                new_arg = self.substitute(arg, mapping)
+                unchanged = unchanged and new_arg is arg
+                new_args[i] = new_arg
+        if unchanged:
+            return expr
+        try:
+            new_node = type(node)(*new_args)
+        except IbisTypeError:
+            return expr
+
+        try:
+            name = expr.get_name()
+        except ExpressionError:
+            name = None
+        return expr._factory(new_node, name=name)
 
 
 class ScalarAggregate(object):
@@ -81,11 +109,10 @@ class ScalarAggregate(object):
         try:
             name = subbed_expr.get_name()
             named_expr = subbed_expr
-        except:
+        except ExpressionError:
             name = self.default_name
             named_expr = subbed_expr.name(self.default_name)
 
-        tables = list(self.memo.values())
         table = self.tables[0]
         for other in self.tables[1:]:
             table = table.cross_join(other)
@@ -129,43 +156,86 @@ class ScalarAggregate(object):
 
 
 def has_multiple_bases(expr):
-    return len(find_all_tables(expr)) > 1
+    return toolz.count(find_immediate_parent_tables(expr)) > 1
 
 
 def reduction_to_aggregation(expr, default_name='tmp'):
-    tables = find_all_tables(expr)
+    tables = list(find_immediate_parent_tables(expr))
 
     try:
         name = expr.get_name()
         named_expr = expr
-    except:
+    except ExpressionError:
         name = default_name
         named_expr = expr.name(default_name)
 
     if len(tables) == 1:
-        table = list(tables.values())[0]
+        table, = tables
         return table.aggregate([named_expr]), name
     else:
         return ScalarAggregate(expr, None, default_name).get_result()
 
 
-def find_all_tables(expr, memo=None):
-    if memo is None:
-        memo = {}
+def find_immediate_parent_tables(expr):
+    """Find every first occurrence of a :class:`ibis.expr.types.TableExpr`
+    object in `expr`.
 
-    node = expr.op()
+    Parameters
+    ----------
+    expr : ir.Expr
 
-    if isinstance(expr, ir.TableExpr):
-        key = id(node)
-        if key not in memo:
-            memo[key] = expr
-        return memo
+    Yields
+    ------
+    e : ir.Expr
 
-    for arg in node.flat_args():
-        if isinstance(arg, ir.Expr):
-            find_all_tables(arg, memo)
+    Notes
+    -----
+    This function does not traverse into TableExpr objects. This means that the
+    underlying PhysicalTable of a Selection will not be yielded, for example.
 
-    return memo
+    Examples
+    --------
+    >>> import ibis, toolz
+    >>> t = ibis.table([('a', 'int64')], name='t')
+    >>> expr = t.mutate(foo=t.a + 1)
+    >>> result = list(find_immediate_parent_tables(expr))
+    >>> len(result)
+    1
+    >>> result[0]  # doctest: +NORMALIZE_WHITESPACE
+    ref_0
+    UnboundTable[table]
+      name: t
+      schema:
+        a : int64
+    Selection[table]
+      table:
+        Table: ref_0
+      selections:
+        Table: ref_0
+        foo = Add[int64*]
+          left:
+            a = Column[int64*] 'a' from table
+              ref_0
+          right:
+            Literal[int8]
+              1
+    """
+    stack = [expr]
+    seen = set()
+
+    while stack:
+        e = stack.pop()
+        node = e.op()
+
+        if node not in seen:
+            seen.add(node)
+
+            if isinstance(e, ir.TableExpr):
+                yield e
+            else:  # Only traverse into non TableExpr objects
+                stack.extend(
+                    arg for arg in node.flat_args() if isinstance(arg, ir.Expr)
+                )
 
 
 def is_scalar_reduce(x):
@@ -267,7 +337,7 @@ class ExprSimplifier(object):
 
         op = expr.op()
 
-        if isinstance(op, ops.ValueNode):
+        if isinstance(op, ops.ValueOp):
             return self._sub(expr, block=block)
         elif isinstance(op, ops.Selection):
             result = self._lift_Selection(expr, block=block)
@@ -335,7 +405,7 @@ class ExprSimplifier(object):
 
         unch = lifted_table is op.table
 
-        lifted_aggs, unch1 = self._lift_arg(op.agg_exprs, block=True)
+        lifted_aggs, unch1 = self._lift_arg(op.metrics, block=True)
         lifted_by, unch2 = self._lift_arg(op.by, block=True)
         lifted_having, unch3 = self._lift_arg(op.having, block=True)
 
@@ -441,7 +511,7 @@ def apply_filter(expr, predicates):
 
         if op.table._is_valid(simplified_predicates):
             result = ops.Aggregation(
-                op.table, op.agg_exprs, by=op.by, having=op.having,
+                op.table, op.metrics, by=op.by, having=op.having,
                 predicates=op.predicates + simplified_predicates,
                 sort_keys=op.sort_keys)
 
@@ -535,15 +605,23 @@ class _PushdownValidate(object):
         return self.valid
 
     def _walk(self, expr):
-        node = expr.op()
-        if isinstance(node, ops.TableColumn):
-            is_valid = self._validate_column(expr)
-            self.valid = self.valid and is_valid
+        stack = [expr]
+        seen = set()
 
-        for arg in node.flat_args():
-            if isinstance(arg, ir.ValueExpr):
-                self._walk(arg)
-            # Skip other types of exprs
+        while stack:
+            e = stack.pop()
+            node = e.op()
+
+            if node not in seen:
+                seen.add(node)
+
+                if isinstance(node, ops.TableColumn):
+                    self.valid = self.valid and self._validate_column(e)
+
+                stack.extend(
+                    arg for arg in node.flat_args()
+                    if isinstance(arg, ir.ValueExpr)
+                )
 
     def _validate_column(self, expr):
         if isinstance(self.parent, ops.Selection):
@@ -742,7 +820,7 @@ class Projector(object):
 def _maybe_resolve_exprs(table, exprs):
     try:
         return table._resolve(exprs)
-    except:
+    except AttributeError:
         return None
 
 
@@ -901,7 +979,7 @@ class FilterValidator(ExprValidator):
         is_valid = True
 
         if isinstance(op, ops.Contains):
-            value_valid = ExprValidator.validate(self, op.value)
+            value_valid = super(FilterValidator, self).validate(op.value)
             is_valid = value_valid
         else:
             roots_valid = []
@@ -912,7 +990,7 @@ class FilterValidator(ExprValidator):
                 elif isinstance(arg, ops.TopKExpr):
                     # TopK not subjected to further analysis for now
                     roots_valid.append(True)
-                elif isinstance(arg, (ir.ArrayExpr, ir.AnalyticExpr)):
+                elif isinstance(arg, (ir.ColumnExpr, ir.AnalyticExpr)):
                     roots_valid.append(self.shares_some_roots(arg))
                 elif isinstance(arg, ir.Expr):
                     raise NotImplementedError
@@ -926,48 +1004,154 @@ class FilterValidator(ExprValidator):
 
 
 def find_source_table(expr):
-    # A more complex version of _find_base_table.
-    # TODO: Revisit/refactor this all at some point
-    node = expr.op()
+    """Find the first table expression observed for each argument that the
+    expression depends on
 
-    # First table expression observed for each argument that the expr
-    # depends on
+    Parameters
+    ----------
+    expr : ir.Expr
+
+    Returns
+    -------
+    table_expr : ir.TableExpr
+
+    Examples
+    --------
+    >>> import ibis
+    >>> t = ibis.table([('a', 'double'), ('b', 'string')], name='t')
+    >>> expr = t.mutate(c=t.a + 42.0)
+    >>> expr  # doctest: +NORMALIZE_WHITESPACE
+    ref_0
+    UnboundTable[table]
+      name: t
+      schema:
+        a : double
+        b : string
+    Selection[table]
+      table:
+        Table: ref_0
+      selections:
+        Table: ref_0
+        c = Add[double*]
+          left:
+            a = Column[double*] 'a' from table
+              ref_0
+          right:
+            Literal[double]
+              42.0
+    >>> find_source_table(expr)
+    UnboundTable[table]
+      name: t
+      schema:
+        a : double
+        b : string
+    >>> left = ibis.table([('a', 'int64'), ('b', 'string')])
+    >>> right = ibis.table([('c', 'int64'), ('d', 'string')])
+    >>> result = left.inner_join(right, left.a == right.c)
+    >>> find_source_table(result)  # doctest: +ELLIPSIS
+    Traceback (most recent call last):
+    ...
+    NotImplementedError: More than one base table not implemented
+    """
     first_tables = []
 
-    def push_first(arg):
-        if not isinstance(arg, ir.Expr):
-            return
-        if isinstance(arg, ir.TableExpr):
-            first_tables.append(arg)
-        else:
-            collect(arg.op())
+    stack = [expr]
+    seen = set()
 
-    def collect(node):
-        for arg in node.flat_args():
-            push_first(arg)
+    while stack:
+        e = stack.pop()
+        op = e.op()
 
-    collect(node)
-    options = util.unique_by_key(first_tables, id)
+        if op not in seen:
+            seen.add(op)
+
+            arguments = [
+                arg for arg in reversed(list(op.flat_args()))
+                if isinstance(arg, ir.Expr)
+            ]
+            first_tables.extend(
+                arg for arg in arguments if isinstance(arg, ir.TableExpr)
+            )
+            stack.extend(
+                arg for arg in arguments if not isinstance(arg, ir.TableExpr)
+            )
+
+    options = list(toolz.unique(first_tables, key=id))
 
     if len(options) > 1:
-        raise NotImplementedError
+        raise NotImplementedError('More than one base table not implemented')
 
     return options[0]
 
 
-def unwrap_ands(expr):
-    out_exprs = []
+def flatten_predicate(expr):
+    """Yield the expressions corresponding to the `And` nodes of a predicate.
 
-    def walk(expr):
-        op = expr.op()
-        if isinstance(op, ops.Comparison):
-            out_exprs.append(expr)
-        elif isinstance(op, ops.And):
-            walk(op.left)
-            walk(op.right)
-        else:
-            raise Exception('Invalid predicate: {0!s}'
-                            .format(expr._repr()))
+    Parameters
+    ----------
+    expr : ir.BooleanColumn
 
-    walk(expr)
-    return out_exprs
+    Returns
+    -------
+    exprs : List[ir.BooleanColumn]
+
+    Examples
+    --------
+    >>> import ibis
+    >>> t = ibis.table([('a', 'int64'), ('b', 'string')], name='t')
+    >>> filt = (t.a == 1) & (t.b == 'foo')
+    >>> predicates = flatten_predicate(filt)
+    >>> len(predicates)
+    2
+    >>> predicates[0]  # doctest: +NORMALIZE_WHITESPACE
+    ref_0
+    UnboundTable[table]
+      name: t
+      schema:
+        a : int64
+        b : string
+    Equals[boolean*]
+      left:
+        a = Column[int64*] 'a' from table
+          ref_0
+      right:
+        Literal[int8]
+          1
+    >>> predicates[1]  # doctest: +NORMALIZE_WHITESPACE
+    ref_0
+    UnboundTable[table]
+      name: t
+      schema:
+        a : int64
+        b : string
+    Equals[boolean*]
+      left:
+        b = Column[string*] 'b' from table
+          ref_0
+      right:
+        Literal[string]
+          foo
+    """
+    predicates = []
+    stack = [expr]
+    seen = set()
+
+    while stack:
+        e = stack.pop()
+
+        if not isinstance(e, ir.BooleanColumn):
+            raise TypeError(
+                'Predicate component is not an instance of ir.BooleanColumn'
+            )
+
+        op = e.op()
+
+        if op not in seen:
+            seen.add(op)
+
+            if isinstance(op, ops.And):
+                stack.append(op.right)
+                stack.append(op.left)
+            else:
+                predicates.append(e)
+    return predicates

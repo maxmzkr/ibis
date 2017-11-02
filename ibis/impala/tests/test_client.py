@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import unittest
+
+import numpy as np
 import pandas as pd
 
-from ibis.compat import unittest
 from ibis.impala.tests.common import IbisTestEnv, ImpalaE2E, connect_test
 from ibis.tests.util import assert_equal
 import ibis
@@ -23,6 +25,12 @@ import ibis.common as com
 import ibis.config as config
 import ibis.expr.types as ir
 import ibis.util as util
+
+import pytest
+
+pytest.importorskip('sqlalchemy')
+pytest.importorskip('hdfs')
+pytest.importorskip('impala.dbapi')
 
 
 ENV = IbisTestEnv()
@@ -281,8 +289,12 @@ LIMIT 10"""
         q = expr.execute(async=True)
         result = q.get_result()
         expected = expr.execute()
-        assert result == expected
+        assert np.allclose(result, expected)
 
+    @pytest.mark.xfail(
+        raises=NotImplementedError,
+        reason='_collect_Union not implemented'
+    )
     def test_query_cancel(self):
         import time
         t = self.db.functional_alltypes

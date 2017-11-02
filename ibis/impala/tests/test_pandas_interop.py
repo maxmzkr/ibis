@@ -12,20 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import numpy as np
+import unittest
+
 import pytest
+
+import numpy as np
 
 from pandas.util.testing import assert_frame_equal
 import pandas as pd
 
-from ibis.compat import unittest
+import ibis
+import ibis.expr.datatypes as dt
+import ibis.expr.types as ir
+
 from ibis.common import IbisTypeError
 from ibis.impala.pandas_interop import pandas_to_ibis_schema, DataFrameWriter
 from ibis.impala.tests.common import ImpalaE2E
-import ibis.expr.datatypes as dt
-import ibis.expr.types as ir
 import ibis.util as util
-import ibis
 
 
 class TestPandasTypeInterop(unittest.TestCase):
@@ -183,7 +186,6 @@ class TestPandasInterop(ImpalaE2E, unittest.TestCase):
         cls.alltypes = cls.alltypes.execute()
 
     def test_alltypes_roundtrip(self):
-        pytest.skip('IMPALA-2750')
         self._check_roundtrip(self.alltypes)
 
     def test_writer_cleanup_deletes_hdfs_dir(self):
@@ -200,7 +202,6 @@ class TestPandasInterop(ImpalaE2E, unittest.TestCase):
         assert not self.con.hdfs.exists(path)
 
     def test_create_table_from_dataframe(self):
-        pytest.skip('IMPALA-2750')
         tname = 'tmp_pandas_{0}'.format(util.guid())
         self.con.create_table(tname, self.alltypes, database=self.tmp_db)
         self.temp_tables.append(tname)
@@ -210,7 +211,6 @@ class TestPandasInterop(ImpalaE2E, unittest.TestCase):
         assert_frame_equal(df, self.alltypes)
 
     def test_insert(self):
-        pytest.skip('IMPALA-2750')
         schema = pandas_to_ibis_schema(exhaustive_df)
 
         table_name = 'tmp_pandas_{0}'.format(util.guid())
@@ -226,18 +226,18 @@ class TestPandasInterop(ImpalaE2E, unittest.TestCase):
         table = self.con.table(table_name, database=self.tmp_db)
 
         result = (table.execute()
-                  .sort_index(by='tinyint_col')
+                  .sort_values(by='tinyint_col')
                   .reset_index(drop=True))
         assert_frame_equal(result, exhaustive_df)
 
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_insert_partition(self):
         # overwrite
 
         # no overwrite
-        pass
+        assert False
 
     def test_round_trip_exhaustive(self):
-        pytest.skip('IMPALA-2750')
         self._check_roundtrip(exhaustive_df)
 
     def _check_roundtrip(self, df):
@@ -246,5 +246,14 @@ class TestPandasInterop(ImpalaE2E, unittest.TestCase):
 
         table = writer.delimited_table(path)
         df2 = table.execute()
-
         assert_frame_equal(df2, df)
+
+
+def test_timestamp_with_timezone():
+    df = pd.DataFrame({
+        'A': pd.date_range('20130101', periods=3, tz='US/Eastern')
+    })
+    schema = pandas_to_ibis_schema(df)
+    expected = ibis.schema([('A', "timestamp('US/Eastern')")])
+    assert schema.equals(expected)
+    assert schema.types[0].equals(dt.Timestamp('US/Eastern'))

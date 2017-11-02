@@ -12,20 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import unittest
 import operator
 
-from ibis.compat import unittest
-from ibis.expr.tests.mocks import MockConnection
-from ibis.sql.tests.test_compiler import ExprTestCases
-from ibis.tests.util import assert_equal
+import pytest
+
+import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
-import ibis.sql.alchemy as alch
-import ibis
+from ibis.expr.tests.mocks import MockConnection
+from ibis.tests.util import assert_equal
 
-from sqlalchemy import types as sat, func as F
-import sqlalchemy.sql as sql
-import sqlalchemy as sa
+sa = pytest.importorskip('sqlalchemy')
+
+from ibis.sql.tests.test_compiler import ExprTestCases  # noqa: E402
+import ibis.sql.alchemy as alch  # noqa: E402
+
+from sqlalchemy import types as sat, func as F  # noqa: E402
+import sqlalchemy.sql as sql  # noqa: E402
 
 L = sa.literal
 
@@ -112,7 +116,7 @@ class TestSQLAlchemySelect(unittest.TestCase, ExprTestCases):
         for name, t, nullable, ibis_type in typespec:
             sqla_type = sa.Column(name, t, nullable=nullable)
             sqla_types.append(sqla_type)
-            ibis_types.append((name, ibis_type(nullable)))
+            ibis_types.append((name, ibis_type(nullable=nullable)))
 
         table = sa.Table('tname', self.meta, *sqla_types)
 
@@ -121,8 +125,9 @@ class TestSQLAlchemySelect(unittest.TestCase, ExprTestCases):
 
         assert_equal(schema, expected)
 
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_ibis_to_sqla_conversion(self):
-        pass
+        assert False
 
     def test_comparisons(self):
         sat = self.sa_alltypes
@@ -507,11 +512,13 @@ class TestSQLAlchemySelect(unittest.TestCase, ExprTestCases):
 
         self._compare_sqla(expr, expected)
 
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_general_sql_function(self):
-        pass
+        assert False
 
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_union(self):
-        pass
+        assert False
 
     def test_table_distinct(self):
         t = self.alltypes

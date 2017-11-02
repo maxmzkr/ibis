@@ -12,26 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import datetime
+import itertools
+import os
+import sys
+import warnings
+import webbrowser
+
 import six
+import toolz
 
 from ibis.common import IbisError, RelationError
 import ibis.common as com
 import ibis.compat as compat
 import ibis.config as config
 import ibis.util as util
-
-
-class Parameter(object):
-
-    """
-    Placeholder, to be implemented
-    """
-
-    pass
-
-
-# ---------------------------------------------------------------------
+import ibis.expr.datatypes as dt
 
 
 class Expr(object):
@@ -39,6 +36,9 @@ class Expr(object):
     """
 
     """
+
+    def _type_display(self):
+        return type(self).__name__
 
     def __init__(self, arg):
         # TODO: all inputs must inherit from a common table API
@@ -69,17 +69,45 @@ class Expr(object):
         from ibis.expr.format import ExprFormatter
         return ExprFormatter(self, memo=memo).get_result()
 
-    def pipe(self, f, *args, **kwargs):
+    def _repr_png_(self):
+        try:
+            import ibis.expr.visualize as viz
+        except ImportError:
+            return None
+        else:
+            try:
+                return viz.to_graph(self).pipe(format='png')
+            except Exception:
+                # Something may go wrong, and we can't error in the notebook
+                # so fallback to the default text representation.
+                return None
+
+    def visualize(self, format='png'):
+        """Visualize an expression in the browser as a PNG image.
+
+        Parameters
+        ----------
+        format : str, optional
+            Defaults to ``'png'``. Some additional formats are
+            ``'jpeg'`` and ``'svg'``. These are specified by the ``graphviz``
+            Python library.
+
+        Notes
+        -----
+        This method opens a web browser tab showing the image of the expression
+        graph created by the code in :module:`ibis.expr.visualize`.
+
+        Raises
+        ------
+        ImportError
+            If ``graphviz`` is not installed.
         """
-        Generic composition function to enable expression pipelining
+        import ibis.expr.visualize as viz
+        path = viz.draw(viz.to_graph(self), format=format)
+        webbrowser.open('file://{}'.format(os.path.abspath(path)))
 
-        >>> (expr
-        >>>  .pipe(f, *args, **kwargs)
-        >>>  .pipe(g, *args2, **kwargs2))
-
-        is equivalent to
-
-        >>> g(f(expr, *args, **kwargs), *args2, **kwargs2)
+    def pipe(self, f, *args, **kwargs):
+        """Generic composition function to enable expression pipelining.
 
         Parameters
         ----------
@@ -92,12 +120,33 @@ class Expr(object):
 
         Examples
         --------
-        >>> def foo(data, a=None, b=None):
-        ...     pass
-        >>> def bar(a, b, data=None):
-        ...     pass
-        >>> expr.pipe(foo, a=5, b=10)
-        >>> expr.pipe((bar, 'data'), 1, 2)
+        >>> import ibis
+        >>> t = ibis.table([('a', 'int64'), ('b', 'string')], name='t')
+        >>> f = lambda a: (a + 1).name('a')
+        >>> g = lambda a: (a * 2).name('a')
+        >>> result1 = t.a.pipe(f).pipe(g)
+        >>> result1  # doctest: +NORMALIZE_WHITESPACE
+        ref_0
+        UnboundTable[table]
+          name: t
+          schema:
+            a : int64
+            b : string
+        a = Multiply[int64*]
+          left:
+            a = Add[int64*]
+              left:
+                a = Column[int64*] 'a' from table
+                  ref_0
+              right:
+                Literal[int8]
+                  1
+          right:
+            Literal[int8]
+              2
+        >>> result2 = g(f(t.a))  # equivalent to the above
+        >>> result1.equals(result2)
+        True
 
         Returns
         -------
@@ -125,7 +174,7 @@ class Expr(object):
     def _can_implicit_cast(self, arg):
         return False
 
-    def execute(self, limit='default', async=False):
+    def execute(self, limit='default', async=False, params=None):
         """
         If this expression is based on physical tables in a database backend,
         execute it against that backend.
@@ -142,9 +191,9 @@ class Expr(object):
           Result of compiling expression and executing in backend
         """
         from ibis.client import execute
-        return execute(self, limit=limit, async=async)
+        return execute(self, limit=limit, async=async, params=params)
 
-    def compile(self, limit=None):
+    def compile(self, limit=None, params=None):
         """
         Compile expression to whatever execution target, to verify
 
@@ -154,7 +203,7 @@ class Expr(object):
            query representation or list thereof
         """
         from ibis.client import compile
-        return compile(self, limit=limit)
+        return compile(self, limit=limit, params=params)
 
     def verify(self):
         """
@@ -162,9 +211,10 @@ class Expr(object):
         """
         try:
             self.compile()
-            return True
-        except:
+        except Exception:
             return False
+        else:
+            return True
 
     def equals(self, other, cache=None):
         if type(self) != type(other):
@@ -183,11 +233,36 @@ class Expr(object):
         pass
 
 
+if sys.version_info.major == 2:
+    # Python 2.7 doesn't return NotImplemented unless the other operand has
+    # an attribute called "timetuple". This is a bug that's fixed in Python 3
+    Expr.timetuple = None
+
+
 def _safe_repr(x, memo=None):
     return x._repr(memo=memo) if isinstance(x, (Expr, Node)) else repr(x)
 
 
-class Node(object):
+class OperationMeta(type):
+
+    def __new__(cls, name, parents, dct):
+        if 'input_type' in dct:
+            from ibis.expr.rules import TypeSignature, signature
+            sig = dct['input_type']
+            if not isinstance(sig, TypeSignature):
+                dct['input_type'] = sig = signature(sig)
+
+                for i, t in enumerate(sig.types):
+                    if t.name is None:
+                        continue
+
+                    if t.name not in dct:
+                        dct[t.name] = _arg_getter(i, doc=t.doc)
+
+        return super(OperationMeta, cls).__new__(cls, name, parents, dct)
+
+
+class Node(six.with_metaclass(OperationMeta, object)):
 
     """
     Node is the base class for all relational algebra and analytical
@@ -202,8 +277,15 @@ class Node(object):
     of Node as merely a typed expression builder.
     """
 
-    def __init__(self, args):
-        self.args = args
+    def __init__(self, args=None):
+        args = args or []
+        self.args = self._validate_args(args)
+
+    def _validate_args(self, args):
+        if not hasattr(self, 'input_type'):
+            return args
+
+        return self.input_type.validate(args)
 
     def __repr__(self):
         return self._repr()
@@ -279,7 +361,6 @@ class Node(object):
         if self._expr_cached is None:
             self._expr_cached = self._make_expr()
         return self._expr_cached
-        # return self._make_expr()
 
     def _make_expr(self):
         klass = self.output_type()
@@ -291,6 +372,15 @@ class Node(object):
         the node wrapped in the appropriate ValueExpr type.
         """
         raise NotImplementedError
+
+    @property
+    def _arg_names(self):
+        try:
+            input_type = self.__class__.input_type
+        except AttributeError:
+            return []
+        else:
+            return [t.name for t in getattr(input_type, 'types', [])]
 
 
 def all_equal(left, right, cache=None):
@@ -304,22 +394,19 @@ def all_equal(left, right, cache=None):
 
     if hasattr(left, 'equals'):
         return left.equals(right, cache=cache)
-    else:
-        return left == right
-    return True
+    return left == right
 
 
-class ValueNode(Node):
+def _arg_getter(i, doc=None):
+    def arg_accessor(self):
+        return self.args[i]
+    return property(arg_accessor, doc=doc)
+
+
+class ValueOp(Node):
 
     def __init__(self, *args):
-        args = self._validate_args(args)
-        Node.__init__(self, args)
-
-    def _validate_args(self, args):
-        if not hasattr(self, 'input_type'):
-            return args
-
-        return self.input_type.validate(args)
+        super(ValueOp, self).__init__(args)
 
     def root_tables(self):
         exprs = [arg for arg in self.args if isinstance(arg, Expr)]
@@ -332,16 +419,19 @@ class ValueNode(Node):
         return False
 
 
-class TableColumn(ValueNode):
+class TableColumn(ValueOp):
 
     """
     Selects a column from a TableExpr
     """
 
     def __init__(self, name, table_expr):
-        Node.__init__(self, [name, table_expr])
+        schema = table_expr.schema()
+        if isinstance(name, six.integer_types):
+            name = schema.name_at_position(name)
 
-        if name not in table_expr.schema():
+        super(TableColumn, self).__init__(name, table_expr)
+        if name not in schema:
             raise com.IbisTypeError(
                 "'{0}' is not a field in {1}".format(name, table_expr.columns)
             )
@@ -382,6 +472,11 @@ class ExpressionList(Node):
 
 class ExprList(Expr):
 
+    def _type_display(self):
+        list_args = [arg._type_display()
+                     for arg in self.op().args]
+        return ', '.join(list_args)
+
     def exprs(self):
         return self.op().args
 
@@ -414,53 +509,150 @@ class ExprList(Expr):
         return ExpressionList(exprs).to_expr()
 
 
-class Literal(ValueNode):
+def infer_literal_type(value):
+    import ibis.expr.rules as rules
 
-    def __init__(self, value):
+    if value is None or value is null:
+        return dt.null
+    elif isinstance(value, bool):
+        return dt.boolean
+    elif isinstance(value, compat.integer_types):
+        return rules.int_literal_class(value)
+    elif isinstance(value, float):
+        return dt.double
+    elif isinstance(value, six.string_types):
+        return dt.string
+    elif isinstance(value, datetime.datetime):
+        return dt.timestamp
+    elif isinstance(value, datetime.date):
+        return dt.date
+    elif isinstance(value, datetime.time):
+        return dt.time
+    elif isinstance(value, list):
+        if not value:
+            return dt.Array(dt.null)
+        return dt.Array(rules.highest_precedence_type(
+            list(map(literal, value))
+        ))
+    elif isinstance(value, collections.OrderedDict):
+        if not value:
+            raise TypeError('Empty struct type not supported')
+        return dt.Struct(
+            list(value.keys()),
+            [literal(element).type() for element in value.values()],
+        )
+    elif isinstance(value, dict):
+        if not value:
+            return dt.Map(dt.null, dt.null)
+        return dt.Map(
+            rules.highest_precedence_type(list(map(literal, value.keys()))),
+            rules.highest_precedence_type(list(map(literal, value.values()))),
+        )
+
+    raise com.InputTypeError(value)
+
+
+class Literal(ValueOp):
+
+    def __init__(self, value, type=None):
+        super(Literal, self).__init__(value, type)
         self.value = value
+        self._output_type = type.scalar_type()
 
     def __repr__(self):
-        return 'Literal(%s)' % repr(self.value)
-
-    @property
-    def args(self):
-        return [self.value]
+        return '{}({})'.format(
+            type(self).__name__,
+            ', '.join(map(repr, self.args))
+        )
 
     def equals(self, other, cache=None):
-        if not isinstance(other, Literal):
-            return False
-        return (isinstance(other.value, type(self.value)) and
-                self.value == other.value)
+        return (
+            isinstance(other, Literal) and
+            isinstance(other.value, type(self.value)) and
+            self.value == other.value
+        )
 
     def output_type(self):
-        import ibis.expr.rules as rules
-        if isinstance(self.value, bool):
-            klass = BooleanScalar
-        elif isinstance(self.value, compat.integer_types):
-            int_type = rules.int_literal_class(self.value)
-            klass = int_type.scalar_type()
-        elif isinstance(self.value, float):
-            klass = DoubleScalar
-        elif isinstance(self.value, six.string_types):
-            klass = StringScalar
-        elif isinstance(self.value, datetime.datetime):
-            klass = TimestampScalar
-        elif isinstance(self.value, datetime.date):
-            klass = DateScalar
-        else:
-            raise com.InputTypeError(self.value)
-
-        return klass
+        return self._output_type
 
     def root_tables(self):
         return []
+
+
+_parameter_counter = itertools.count()
+
+
+def _parameter_name():
+    return 'param[{:d}]'.format(next(_parameter_counter))
+
+
+class ScalarParameter(ValueOp):
+
+    def __init__(self, type, name=None):
+        super(ScalarParameter, self).__init__(type)
+        self.name = name
+        self.output_type = type.scalar_type
+
+    def __repr__(self):
+        return '{}(name={!r}, type={})'.format(
+            type(self).__name__, self.name, self.type
+        )
+
+    @property
+    def type(self):
+        return self.args[0]
+
+    def equals(self, other, cache=None):
+        return (
+            isinstance(other, ScalarParameter) and
+            self.name == other.name and
+            self.type.equals(other.type, cache=cache)
+        )
+
+    def root_tables(self):
+        return []
+
+    def resolve_name(self):
+        return self.name
+
+
+def param(type, name=None):
+    """Create a parameter of a particular type to be defined just before
+    execution.
+
+    Parameters
+    ----------
+    type : dt.DataType
+        The type of the unbound parameter, e.g., double, int64, date, etc.
+    name : str, optional
+        The name of the parameter
+
+    Returns
+    -------
+    ScalarExpr
+
+    Examples
+    --------
+    >>> import ibis
+    >>> import ibis.expr.datatypes as dt
+    >>> start = ibis.param(dt.date)
+    >>> end = ibis.param(dt.date)
+    >>> schema = [('timestamp_col', 'timestamp'), ('value', 'double')]
+    >>> t = ibis.table(schema)
+    >>> predicates = [t.timestamp_col >= start, t.timestamp_col <= end]
+    >>> expr = t.filter(predicates).value.sum()
+    """
+    if name is None:
+        name = _parameter_name()
+    expr = ScalarParameter(dt.validate_type(type), name=name).to_expr()
+    return expr.name(name)
 
 
 def distinct_roots(*args):
     all_roots = []
     for arg in args:
         all_roots.extend(arg._root_tables())
-    return util.unique_by_key(all_roots, id)
+    return list(toolz.unique(all_roots, key=id))
 
 
 # ---------------------------------------------------------------------
@@ -474,28 +666,25 @@ class ValueExpr(Expr):
     either a single value (scalar)
     """
 
-    _implicit_casts = set()
+    _implicit_casts = frozenset()
 
     def __init__(self, arg, name=None):
-        Expr.__init__(self, arg)
+        super(ValueExpr, self).__init__(arg)
         self._name = name
 
     def equals(self, other, cache=None):
-        if not isinstance(other, ValueExpr):
-            return False
-
-        if self._name != other._name:
-            return False
-
-        return Expr.equals(self, other, cache=cache)
+        return (
+            isinstance(other, ValueExpr) and
+            self._name == other._name and
+            super(ValueExpr, self).equals(other, cache=cache)
+        )
 
     def type(self):
-        import ibis.expr.datatypes as dt
-        return dt._primitive_types[self._typename]
-
-    def _base_type(self):
-        # Parametric types like "decimal"
-        return self.type()
+        raise NotImplementedError(
+            'Expressions of type {0} must implement a type method'.format(
+                type(self).__name__
+            )
+        )
 
     def _can_cast_implicit(self, typename):
         from ibis.expr.rules import ImplicitCast
@@ -522,10 +711,14 @@ class ValueExpr(Expr):
 
 class ScalarExpr(ValueExpr):
 
-    pass
+    def _type_display(self):
+        return str(self.type())
 
 
-class ArrayExpr(ValueExpr):
+class ColumnExpr(ValueExpr):
+
+    def _type_display(self):
+        return '{}*'.format(self.type())
 
     def parent(self):
         return self._arg
@@ -552,6 +745,9 @@ class AnalyticExpr(Expr):
             return type(self)(arg)
         return factory
 
+    def _type_display(self):
+        return str(self.type())
+
     def type(self):
         return 'analytic'
 
@@ -564,12 +760,16 @@ class TableExpr(Expr):
             return TableExpr(arg)
         return factory
 
+    def _type_display(self):
+        return 'table'
+
     def _is_valid(self, exprs):
         try:
             self._assert_valid(util.promote_list(exprs))
-            return True
-        except:
+        except com.RelationError:
             return False
+        else:
+            return True
 
     def _assert_valid(self, exprs):
         from ibis.expr.analysis import ExprValidator
@@ -579,7 +779,7 @@ class TableExpr(Expr):
         return name in self.schema()
 
     def __getitem__(self, what):
-        if isinstance(what, six.string_types):
+        if isinstance(what, six.string_types + six.integer_types):
             return self.get_column(what)
 
         if isinstance(what, slice):
@@ -605,32 +805,43 @@ class TableExpr(Expr):
         if isinstance(what, (list, tuple, TableExpr)):
             # Projection case
             return self.projection(what)
-        elif isinstance(what, BooleanArray):
+        elif isinstance(what, BooleanColumn):
             # Boolean predicate
             return self.filter([what])
-        elif isinstance(what, ArrayExpr):
+        elif isinstance(what, ColumnExpr):
             # Projection convenience
             return self.projection(what)
         else:
-            raise NotImplementedError
+            raise NotImplementedError(
+                'Selection rows or columns with {} objects is not '
+                'supported'.format(type(what).__name__)
+            )
 
     def __len__(self):
         raise com.ExpressionError('Use .count() instead')
 
+    def __setstate__(self, instance_dictionary):
+        self.__dict__ = instance_dictionary
+
     def __getattr__(self, key):
         try:
-            return object.__getattribute__(self, key)
-        except AttributeError:
-            if not self._is_materialized() or key not in self.schema():
-                raise
+            schema = self.schema()
+        except com.IbisError:
+            raise AttributeError(key)
 
+        if key not in schema:
+            raise AttributeError(key)
+
+        try:
             return self.get_column(key)
+        except com.IbisTypeError:
+            raise AttributeError(key)
 
     def __dir__(self):
         attrs = dir(type(self))
         if self._is_materialized():
-            attrs = list(sorted(set(attrs + self.schema().names)))
-        return attrs
+            attrs = frozenset(attrs + self.schema().names)
+        return sorted(attrs)
 
     def _resolve(self, exprs):
         exprs = util.promote_list(exprs)
@@ -645,6 +856,8 @@ class TableExpr(Expr):
     def _ensure_expr(self, expr):
         if isinstance(expr, six.string_types):
             return self[expr]
+        elif isinstance(expr, six.integer_types):
+            return self[self.schema().name_at_position(expr)]
         elif not isinstance(expr, Expr):
             return expr(self)
         else:
@@ -659,7 +872,17 @@ class TableExpr(Expr):
 
         Examples
         --------
-        a, b, c = table.get_columns(['a', 'b', 'c'])
+        >>> import ibis
+        >>> table = ibis.table(
+        ...    [
+        ...        ('a', 'int64'),
+        ...        ('b', 'string'),
+        ...        ('c', 'timestamp'),
+        ...        ('d', 'float'),
+        ...    ],
+        ...    name='t'
+        ... )
+        >>> a, b, c = table.get_columns(['a', 'b', 'c'])
 
         Returns
         -------
@@ -692,7 +915,7 @@ class TableExpr(Expr):
         """
         if not self._is_materialized():
             raise IbisError('Table operation is not yet materialized')
-        return self.op().get_schema()
+        return self.op().schema
 
     def _is_materialized(self):
         # The operation produces a known schema
@@ -709,7 +932,7 @@ class TableExpr(Expr):
         """
         expr = self._ensure_expr(expr)
 
-        if not isinstance(expr, ArrayExpr):
+        if not isinstance(expr, ColumnExpr):
             raise com.InputTypeError('Must pass array expression')
 
         if name is not None:
@@ -724,7 +947,11 @@ class TableExpr(Expr):
 
         Examples
         --------
-        x.group_by([b1, b2]).aggregate(metrics)
+        >>> import ibis
+        >>> pairs = [('a', 'int32'), ('b', 'timestamp'), ('c', 'double')]
+        >>> t = ibis.table(pairs)
+        >>> b1, b2 = t.a, t.b
+        >>> result = t.group_by([b1, b2]).aggregate(sum_of_c=t.c.sum())
 
         Notes
         -----
@@ -749,12 +976,14 @@ class TableExpr(Expr):
 
 class AnyValue(ValueExpr):
 
-    _typename = 'any'
+    def type(self):
+        return dt.any
 
 
 class NullValue(AnyValue):
 
-    _typename = 'null'
+    def type(self):
+        return dt.null
 
     def _can_cast_implicit(self, typename):
         return True
@@ -772,32 +1001,42 @@ class IntegerValue(NumericValue):
 
 class BooleanValue(NumericValue):
 
-    _typename = 'boolean'
+    def type(self):
+        return dt.boolean
 
 
 class Int8Value(IntegerValue):
 
-    _typename = 'int8'
-    _implicit_casts = set(['int16', 'int32', 'int64', 'float', 'double',
-                           'decimal'])
+    _implicit_casts = set([
+        'int16', 'int32', 'int64', 'float', 'double', 'decimal'
+    ])
+
+    def type(self):
+        return dt.int8
 
 
 class Int16Value(IntegerValue):
 
-    _typename = 'int16'
     _implicit_casts = set(['int32', 'int64', 'float', 'double', 'decimal'])
+
+    def type(self):
+        return dt.int16
 
 
 class Int32Value(IntegerValue):
 
-    _typename = 'int32'
     _implicit_casts = set(['int64', 'float', 'double', 'decimal'])
+
+    def type(self):
+        return dt.int32
 
 
 class Int64Value(IntegerValue):
 
-    _typename = 'int64'
     _implicit_casts = set(['float', 'double', 'decimal'])
+
+    def type(self):
+        return dt.int64
 
 
 class FloatingValue(NumericValue):
@@ -806,40 +1045,57 @@ class FloatingValue(NumericValue):
 
 class FloatValue(FloatingValue):
 
-    _typename = 'float'
     _implicit_casts = set(['double', 'decimal'])
+
+    def type(self):
+        return dt.float
 
 
 class DoubleValue(FloatingValue):
 
-    _typename = 'double'
     _implicit_casts = set(['decimal'])
+
+    def type(self):
+        return dt.double
 
 
 class StringValue(AnyValue):
 
-    _typename = 'string'
+    def type(self):
+        return dt.string
 
     def _can_compare(self, other):
-        return isinstance(other, StringValue)
+        return isinstance(other, (StringValue, TemporalValue))
 
 
-class DecimalValue(NumericValue):
-
-    _typename = 'decimal'
-    _implicit_casts = set(['float', 'double'])
-
-    def __init__(self, meta):
-        self.meta = meta
-        self._precision = meta.precision
-        self._scale = meta.scale
+class BinaryValue(AnyValue):
 
     def type(self):
-        from ibis.expr.datatypes import Decimal
-        return Decimal(self._precision, self._scale)
+        return dt.binary
 
-    def _base_type(self):
-        return 'decimal'
+    def _can_compare(self, other):
+        return isinstance(other, BinaryValue)
+
+
+class ParameterizedValue(AnyValue):
+
+    def __init__(self, meta, name=None):
+        super(ParameterizedValue, self).__init__(meta, name=name)
+        self.meta = meta
+
+    def type(self):
+        return self.meta
+
+    @property
+    def _factory(self):
+        def factory(arg, name=None):
+            return type(self)(arg, self.meta, name=name)
+        return factory
+
+
+class DecimalValue(ParameterizedValue, NumericValue):
+
+    _implicit_casts = set(['float', 'double'])
 
     @classmethod
     def _make_constructor(cls, meta):
@@ -848,9 +1104,15 @@ class DecimalValue(NumericValue):
         return constructor
 
 
-class DateValue(AnyValue):
+class TemporalValue(AnyValue):
+    def _can_compare(self, other):
+        return isinstance(other, (TemporalValue, StringValue))
 
-    _typename = 'date'
+
+class DateValue(TemporalValue):
+
+    def type(self):
+        return dt.date
 
     def _can_implicit_cast(self, arg):
         op = arg.op()
@@ -862,9 +1124,6 @@ class DateValue(AnyValue):
             except ValueError:
                 return False
         return False
-
-    def _can_compare(self, other):
-        return isinstance(other, DateValue)
 
     def _implicit_cast(self, arg):
         # assume we've checked this is OK at this point...
@@ -872,13 +1131,56 @@ class DateValue(AnyValue):
         return DateScalar(op)
 
 
-class TimestampValue(AnyValue):
+class TimeValue(TemporalValue):
 
-    _typename = 'timestamp'
+    def type(self):
+        return dt.time
 
     def _can_implicit_cast(self, arg):
         op = arg.op()
         if isinstance(op, Literal):
+            try:
+                from ibis.compat import to_time
+                to_time(op.value)
+                return True
+            except ValueError:
+                return False
+        return False
+
+    def _can_compare(self, other):
+        return isinstance(other, (TimeValue, StringValue))
+
+    def _implicit_cast(self, arg):
+        # assume we've checked this is OK at this point...
+        op = arg.op()
+        return TimeScalar(op)
+
+
+class TimestampValue(TemporalValue):
+
+    def __init__(self, meta=None):
+        self.meta = meta
+        self._timezone = getattr(meta, 'timezone', None)
+
+    def type(self):
+        return dt.Timestamp(timezone=self._timezone)
+
+    @classmethod
+    def _make_constructor(cls, meta):
+        def constructor(arg, name=None):
+            return cls(arg, meta, name=name)
+        return constructor
+
+    def _can_implicit_cast(self, arg):
+        op = arg.op()
+        if isinstance(op, Literal):
+            if isinstance(op.value, six.integer_types):
+                warnings.warn(
+                    'Integer values for timestamp literals are deprecated in '
+                    '0.11.0 and will be removed in 0.12.0. To pass integers '
+                    'as timestamp literals, use '
+                    'pd.Timestamp({:d}, unit=...)'.format(op.value)
+                )
             try:
                 import pandas as pd
                 pd.Timestamp(op.value)
@@ -887,16 +1189,58 @@ class TimestampValue(AnyValue):
                 return False
         return False
 
-    def _can_compare(self, other):
-        return isinstance(other, TimestampValue)
-
     def _implicit_cast(self, arg):
         # assume we've checked this is OK at this point...
         op = arg.op()
         return TimestampScalar(op)
 
 
-class NumericArray(ArrayExpr, NumericValue):
+class ArrayValue(ParameterizedValue):
+
+    def _can_compare(self, other):
+        return isinstance(other, ArrayValue)
+
+    def _can_cast_implicit(self, typename):
+        if not isinstance(typename, dt.Array):
+            return False
+
+        self_type = self.type()
+        return (
+            super(ArrayValue, self)._can_cast_implicit(typename) or
+            self_type.equals(dt.Array(dt.null)) or
+            self_type.equals(dt.Array(dt.any))
+        )
+
+
+class MapValue(ParameterizedValue):
+
+    def _can_compare(self, other):
+        return isinstance(other, MapValue)
+
+    def _can_cast_implicit(self, typename):
+        if not isinstance(typename, dt.Map):
+            return False
+
+        self_type = self.type()
+        return (
+            super(MapValue, self)._can_cast_implicit(typename) or
+            self_type.equals(dt.Map(dt.null, dt.null)) or
+            self_type.equals(dt.Map(dt.any, dt.any))
+        )
+
+
+class StructValue(ParameterizedValue):
+
+    def _can_compare(self, other):
+        return isinstance(other, StructValue)
+
+    def __dir__(self):
+        return sorted(frozenset(
+            itertools.chain(dir(type(self)), self.type().names)
+        ))
+
+
+class NumericColumn(ColumnExpr, NumericValue):
     pass
 
 
@@ -907,7 +1251,7 @@ class NullScalar(NullValue, ScalarExpr):
     pass
 
 
-class NullArray(ArrayExpr, NullValue):
+class NullColumn(ColumnExpr, NullValue):
     pass
 
 
@@ -915,7 +1259,7 @@ class BooleanScalar(ScalarExpr, BooleanValue):
     pass
 
 
-class BooleanArray(NumericArray, BooleanValue):
+class BooleanColumn(NumericColumn, BooleanValue):
     pass
 
 
@@ -923,7 +1267,7 @@ class Int8Scalar(ScalarExpr, Int8Value):
     pass
 
 
-class Int8Array(NumericArray, Int8Value):
+class Int8Column(NumericColumn, Int8Value):
     pass
 
 
@@ -931,7 +1275,7 @@ class Int16Scalar(ScalarExpr, Int16Value):
     pass
 
 
-class Int16Array(NumericArray, Int16Value):
+class Int16Column(NumericColumn, Int16Value):
     pass
 
 
@@ -939,7 +1283,7 @@ class Int32Scalar(ScalarExpr, Int32Value):
     pass
 
 
-class Int32Array(NumericArray, Int32Value):
+class Int32Column(NumericColumn, Int32Value):
     pass
 
 
@@ -947,7 +1291,7 @@ class Int64Scalar(ScalarExpr, Int64Value):
     pass
 
 
-class Int64Array(NumericArray, Int64Value):
+class Int64Column(NumericColumn, Int64Value):
     pass
 
 
@@ -955,7 +1299,7 @@ class FloatScalar(ScalarExpr, FloatValue):
     pass
 
 
-class FloatArray(NumericArray, FloatValue):
+class FloatColumn(NumericColumn, FloatValue):
     pass
 
 
@@ -963,7 +1307,7 @@ class DoubleScalar(ScalarExpr, DoubleValue):
     pass
 
 
-class DoubleArray(NumericArray, DoubleValue):
+class DoubleColumn(NumericColumn, DoubleValue):
     pass
 
 
@@ -971,7 +1315,15 @@ class StringScalar(ScalarExpr, StringValue):
     pass
 
 
-class StringArray(ArrayExpr, StringValue):
+class StringColumn(ColumnExpr, StringValue):
+    pass
+
+
+class BinaryScalar(ScalarExpr, BinaryValue):
+    pass
+
+
+class BinaryColumn(ColumnExpr, BinaryValue):
     pass
 
 
@@ -979,16 +1331,30 @@ class DateScalar(ScalarExpr, DateValue):
     pass
 
 
-class DateArray(ArrayExpr, DateValue):
+class DateColumn(ColumnExpr, DateValue):
+    pass
+
+
+class TimeScalar(ScalarExpr, TimeValue):
+    pass
+
+
+class TimeColumn(ColumnExpr, TimeValue):
     pass
 
 
 class TimestampScalar(ScalarExpr, TimestampValue):
-    pass
+
+    def __init__(self, arg, meta=None, name=None):
+        ScalarExpr.__init__(self, arg, name=name)
+        TimestampValue.__init__(self, meta=meta)
 
 
-class TimestampArray(ArrayExpr, TimestampValue):
-    pass
+class TimestampColumn(ColumnExpr, TimestampValue):
+
+    def __init__(self, arg, meta=None, name=None):
+        ColumnExpr.__init__(self, arg, name=name)
+        TimestampValue.__init__(self, meta=meta)
 
 
 class DecimalScalar(DecimalValue, ScalarExpr):
@@ -997,44 +1363,22 @@ class DecimalScalar(DecimalValue, ScalarExpr):
         DecimalValue.__init__(self, meta)
         ScalarExpr.__init__(self, arg, name=name)
 
-    @property
-    def _factory(self):
-        def factory(arg, name=None):
-            return DecimalScalar(arg, self.meta, name=name)
-        return factory
 
-
-class DecimalArray(DecimalValue, NumericArray):
+class DecimalColumn(DecimalValue, NumericColumn):
 
     def __init__(self, arg, meta, name=None):
         DecimalValue.__init__(self, meta)
-        ArrayExpr.__init__(self, arg, name=name)
-
-    @property
-    def _factory(self):
-        def factory(arg, name=None):
-            return DecimalArray(arg, self.meta, name=name)
-        return factory
+        NumericColumn.__init__(self, arg, name=name)
 
 
-class CategoryValue(AnyValue):
+class CategoryValue(ParameterizedValue):
 
     """
     Represents some ordered data categorization; tracked as an int32 value
     until explicitly
     """
 
-    _typename = 'category'
     _implicit_casts = Int16Value._implicit_casts
-
-    def __init__(self, meta):
-        self.meta = meta
-
-    def type(self):
-        return self.meta
-
-    def _base_type(self):
-        return 'category'
 
     def _can_compare(self, other):
         return isinstance(other, IntegerValue)
@@ -1046,24 +1390,54 @@ class CategoryScalar(CategoryValue, ScalarExpr):
         CategoryValue.__init__(self, meta)
         ScalarExpr.__init__(self, arg, name=name)
 
-    @property
-    def _factory(self):
-        def factory(arg, name=None):
-            return CategoryScalar(arg, self.meta, name=name)
-        return factory
 
-
-class CategoryArray(CategoryValue, ArrayExpr):
+class CategoryColumn(CategoryValue, ColumnExpr):
 
     def __init__(self, arg, meta, name=None):
         CategoryValue.__init__(self, meta)
-        ArrayExpr.__init__(self, arg, name=name)
+        ColumnExpr.__init__(self, arg, name=name)
 
-    @property
-    def _factory(self):
-        def factory(arg, name=None):
-            return CategoryArray(arg, self.meta, name=name)
-        return factory
+
+class ArrayScalar(ArrayValue, ScalarExpr):
+
+    def __init__(self, arg, meta, name=None):
+        ArrayValue.__init__(self, meta)
+        ScalarExpr.__init__(self, arg, name=name)
+
+
+class ArrayColumn(ArrayValue, ColumnExpr):
+
+    def __init__(self, arg, meta, name=None):
+        ArrayValue.__init__(self, meta)
+        ColumnExpr.__init__(self, arg, name=name)
+
+
+class MapScalar(MapValue, ScalarExpr):
+
+    def __init__(self, arg, meta, name=None):
+        MapValue.__init__(self, meta)
+        ScalarExpr.__init__(self, arg, name=name)
+
+
+class MapColumn(MapValue, ColumnExpr):
+
+    def __init__(self, arg, meta, name=None):
+        MapValue.__init__(self, meta)
+        ColumnExpr.__init__(self, arg, name=name)
+
+
+class StructScalar(StructValue, ScalarExpr):
+
+    def __init__(self, arg, meta, name=None):
+        StructValue.__init__(self, meta)
+        ScalarExpr.__init__(self, arg, name=name)
+
+
+class StructColumn(StructValue, ColumnExpr):
+
+    def __init__(self, arg, meta, name=None):
+        StructValue.__init__(self, meta)
+        ColumnExpr.__init__(self, arg, name=name)
 
 
 class UnnamedMarker(object):
@@ -1086,22 +1460,56 @@ def as_value_expr(val):
     return val
 
 
-def literal(value):
-    """
-    Create a scalar expression from a Python value
+def literal(value, type=None):
+    """Create a scalar expression from a Python value.
 
     Parameters
     ----------
     value : some Python basic type
+        A Python value
+    type : ibis type or string, optional
+        An instance of :class:`ibis.expr.datatypes.DataType` or a string
+        indicating the ibis type of `value`. This parameter should only be used
+        in cases where ibis's type inference isn't sufficient for discovering
+        the type of `value`.
 
     Returns
     -------
-    lit_value : value expression, type depending on input value
+    literal_value : Literal
+        An expression representing a literal value
+
+    Examples
+    --------
+    >>> import ibis
+    >>> x = ibis.literal(42)
+    >>> x.type()
+    int8
+    >>> y = ibis.literal(42, type='double')
+    >>> y.type()
+    double
+    >>> ibis.literal('foobar', type='int64')  # doctest: +ELLIPSIS
+    Traceback (most recent call last):
+      ...
+    TypeError: Value 'foobar' cannot be safely coerced to int64
     """
-    if value is None or value is null:
-        return null()
+    if hasattr(value, 'op') and isinstance(value.op(), Literal):
+        return value
+
+    if type is None:
+        type = infer_literal_type(value)
     else:
-        return Literal(value).to_expr()
+        type = dt.validate_type(type)
+
+    if not type.valid_literal(value):
+        raise TypeError(
+            'Value {!r} cannot be safely coerced to {}'.format(value, type)
+        )
+
+    if value is None or value is _NULL or value is null:
+        result = null().cast(type)
+    else:
+        result = Literal(value, type=type).to_expr()
+    return result
 
 
 _NULL = None
@@ -1134,7 +1542,7 @@ def sequence(values):
     return ValueList(values).to_expr()
 
 
-class NullLiteral(ValueNode):
+class NullLiteral(ValueOp):
 
     """
     Typeless NULL literal
@@ -1157,15 +1565,17 @@ class NullLiteral(ValueNode):
         return []
 
 
-class ListExpr(ArrayExpr, AnyValue):
+class ListExpr(ColumnExpr, AnyValue):
     pass
 
 
 class SortExpr(Expr):
-    pass
+
+    def _type_display(self):
+        return 'array-sort'
 
 
-class ValueList(ValueNode):
+class ValueList(ValueOp):
 
     """
     Data structure for a list of value expressions
@@ -1173,7 +1583,7 @@ class ValueList(ValueNode):
 
     def __init__(self, args):
         self.values = [as_value_expr(x) for x in args]
-        ValueNode.__init__(self, self.values)
+        ValueOp.__init__(self, self.values)
 
     def root_tables(self):
         return distinct_roots(*self.values)

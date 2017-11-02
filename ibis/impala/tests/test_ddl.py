@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import unittest
+
 from copy import copy
 import gc
 
@@ -22,15 +24,20 @@ from posixpath import join as pjoin
 import pytest
 
 from ibis.expr.tests.mocks import MockConnection
-from ibis.compat import unittest, mock
-from ibis.impala import ddl
-from ibis.impala.compat import HS2Error, ImpylaError
-from ibis.impala.client import build_ast
-from ibis.impala.tests.common import ENV, ImpalaE2E, connect_test
-from ibis.tests.util import assert_equal
+from ibis.compat import mock
 import ibis.common as com
 import ibis.expr.types as ir
 import ibis.util as util
+from ibis.tests.util import assert_equal
+
+pytest.importorskip('hdfs')
+pytest.importorskip('sqlalchemy')
+pytest.importorskip('impala.dbapi')
+
+from ibis.impala import ddl  # noqa: E402
+from ibis.impala.compat import HS2Error, ImpylaError  # noqa: E402
+from ibis.impala.client import build_ast  # noqa: E402
+from ibis.impala.tests.common import ENV, ImpalaE2E, connect_test  # noqa: E402
 
 
 class TestDropTable(unittest.TestCase):
@@ -116,8 +123,9 @@ LOAD DATA INPATH '/path/to/data' OVERWRITE INTO TABLE foo.`functional_alltypes`
 PARTITION (year=2007, month=7)"""
         assert result == expected
 
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_select_overwrite(self):
-        pass
+        assert False
 
 
 class TestCacheTable(unittest.TestCase):
@@ -379,7 +387,7 @@ LOCATION '{0}'""".format(directory)
         schema = ibis.schema([('a', 'string'),
                               ('b', 'int32'),
                               ('c', 'double'),
-                              ('d', 'decimal(12,2)')])
+                              ('d', 'decimal(12, 2)')])
 
         stmt = ddl.CreateTableDelimited('new_table', path, schema,
                                         delimiter='|',
@@ -394,7 +402,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS foo.`new_table`
 (`a` string,
  `b` int,
  `c` double,
- `d` decimal(12,2))
+ `d` decimal(12, 2))
 ROW FORMAT DELIMITED
 FIELDS TERMINATED BY '|'
 ESCAPED BY '\\'
@@ -500,8 +508,9 @@ FROM functional_alltypes"""
         self.assertRaises(ValueError, _create_table, 'tname', self.t,
                           format='foo')
 
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_partition_by(self):
-        pass
+        assert False
 
 
 class TestDDLE2E(ImpalaE2E, unittest.TestCase):
@@ -677,6 +686,16 @@ class TestDDLE2E(ImpalaE2E, unittest.TestCase):
         result = self.con.table(table_name).execute()
         assert len(result) == 0
 
+    def test_truncate_table_expression(self):
+        expr = self.alltypes.limit(5)
+
+        table_name = _random_table_name()
+        self.con.create_table(table_name, obj=expr)
+        self.temp_tables.append(table_name)
+        t = self.con.table(table_name)
+        t.truncate()
+        assert len(t.execute()) == 0
+
     def test_ctas_from_table_expr(self):
         expr = self.alltypes
         table_name = _random_table_name()
@@ -688,7 +707,7 @@ class TestDDLE2E(ImpalaE2E, unittest.TestCase):
     def test_create_empty_table(self):
         schema = ibis.schema([('a', 'string'),
                               ('b', 'timestamp'),
-                              ('c', 'decimal(12,8)'),
+                              ('c', 'decimal(12, 8)'),
                               ('d', 'double')])
 
         table_name = _random_table_name()
@@ -1022,8 +1041,9 @@ class TestDDLE2E(ImpalaE2E, unittest.TestCase):
         t = self.con.table(table_name)
         t.limit(10).execute()
 
+    @pytest.mark.xfail(raises=AssertionError, reason='NYT')
     def test_query_text_file_regex(self):
-        pass
+        assert False
 
     def test_query_delimited_file_directory(self):
         hdfs_path = pjoin(self.test_data_dir, 'csv')
@@ -1050,10 +1070,10 @@ CREATE EXTERNAL TABLE {0}
  `group2` char(10))
 ROW FORMAT DELIMITED
 FIELDS TERMINATED BY ','
-LOCATION '/tmp'"""
+LOCATION '/tmp/{1}'"""
 
         full_path = '{0}.testing_{1}'.format(self.tmp_db, util.guid())
-        sql = statement.format(full_path)
+        sql = statement.format(full_path, util.guid())
 
         self.con._execute(sql, results=False)
 
@@ -1128,8 +1148,6 @@ def _assert_table_not_exists(con, table_name, database=None):
         con.table(tname)
     except ImpylaError:
         pass
-    except:
-        raise
 
 
 def _ensure_drop(con, table_name, database=None):

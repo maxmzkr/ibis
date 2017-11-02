@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import unittest
+
 import ibis
 
 from ibis.impala.compiler import to_sql
-from ibis.compat import unittest
 
 
 class TestImpalaSQL(unittest.TestCase):
@@ -173,3 +174,25 @@ WHERE t2.`movieid` IN (
 )"""
     compiled_result = to_sql(result)
     assert compiled_result == expected
+
+
+def test_logically_negate_complex_boolean_expr():
+    t = ibis.table(
+        [
+            ('a', 'string'),
+            ('b', 'double'),
+            ('c', 'int64'),
+            ('d', 'string'),
+        ],
+        name='t'
+    )
+
+    def f(t):
+        return t.a.isin(['foo']) & t.c.notnull()
+
+    expr = f(t)
+    result = to_sql(~expr)
+    expected = """\
+SELECT NOT (`a` IN ('foo') AND `c` IS NOT NULL) AS `tmp`
+FROM t"""
+    assert result == expected

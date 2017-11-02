@@ -14,7 +14,9 @@
 
 import sqlalchemy as sa
 
-from ibis.sql.alchemy import unary, varargs, fixed_arity
+import toolz
+
+from ibis.sql.alchemy import unary, varargs, fixed_arity, _variance_reduction
 import ibis.sql.alchemy as alch
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
@@ -33,14 +35,19 @@ def _cast(t, expr):
     sa_arg = t.translate(arg)
     sa_type = t.get_sqla_type(target_type)
 
-    # SQLite does not have a physical date/time/timestamp type, so
-    # unfortunately cast to typestamp must be a no-op, and we have to trust
-    # that the user's data can actually be correctly parsed by SQLite.
     if isinstance(target_type, dt.Timestamp):
-        if not isinstance(arg, (ir.IntegerValue, ir.StringValue)):
-            raise com.TranslationError(type(arg))
+        if isinstance(arg, ir.IntegerValue):
+            return sa.func.datetime(sa_arg, 'unixepoch')
+        elif isinstance(arg, ir.StringValue):
+            return sa.func.strftime('%Y-%m-%d %H:%M:%f', sa_arg)
+        raise com.TranslationError(type(arg))
 
-        return sa_arg
+    if isinstance(target_type, dt.Date):
+        if isinstance(arg, ir.IntegerValue):
+            return sa.func.date(sa.func.datetime(sa_arg, 'unixepoch'))
+        elif isinstance(arg, ir.StringValue):
+            return sa.func.date(sa_arg)
+        raise com.TranslationError(type(arg))
 
     if isinstance(arg, ir.CategoryValue) and target_type == 'int32':
         return sa_arg
@@ -110,7 +117,7 @@ def _strftime_int(fmt):
     def translator(t, expr):
         arg, = expr.op().args
         sa_arg = t.translate(arg)
-        return sa.cast(sa.func.strftime(fmt, sa_arg), sa.types.INTEGER)
+        return sa.cast(sa.func.strftime(fmt, sa_arg), sa.INTEGER)
     return translator
 
 
@@ -123,6 +130,26 @@ def _millisecond(t, expr):
     sa_arg = t.translate(arg)
     fractional_second = sa.func.strftime('%f', sa_arg)
     return (fractional_second * 1000) % 1000
+
+
+def _identical_to(t, expr):
+    left, right = args = expr.op().args
+    if left.equals(right):
+        return True
+    else:
+        left, right = map(t.translate, args)
+        return sa.func.coalesce(
+            (left.is_(None) & right.is_(None)) | (left == right),
+            False
+        )
+
+
+def _log(t, expr):
+    arg, base = expr.op().args
+    sa_arg = t.translate(arg)
+    if base is None:
+        return sa.func._ibis_sqlite_ln(sa_arg)
+    return sa.func._ibis_sqlite_log(sa_arg, t.translate(base))
 
 
 _operation_registry.update({
@@ -158,7 +185,30 @@ _operation_registry.update({
     ops.ExtractMinute: _strftime_int('%M'),
     ops.ExtractSecond: _strftime_int('%S'),
     ops.ExtractMillisecond: _millisecond,
-    ops.TimestampNow: _now
+    ops.TimestampNow: _now,
+    ops.IdenticalTo: _identical_to,
+
+    ops.RegexSearch: fixed_arity(sa.func._ibis_sqlite_regex_search, 2),
+    ops.RegexReplace: fixed_arity(sa.func._ibis_sqlite_regex_replace, 3),
+    ops.RegexExtract: fixed_arity(sa.func._ibis_sqlite_regex_extract, 3),
+
+    ops.Sqrt: fixed_arity(sa.func._ibis_sqlite_sqrt, 1),
+    ops.Power: fixed_arity(sa.func._ibis_sqlite_power, 2),
+    ops.Exp: fixed_arity(sa.func._ibis_sqlite_exp, 1),
+    ops.Ln: fixed_arity(sa.func._ibis_sqlite_ln, 1),
+    ops.Log: _log,
+    ops.Log10: fixed_arity(sa.func._ibis_sqlite_log10, 1),
+    ops.Log2: fixed_arity(sa.func._ibis_sqlite_log2, 1),
+    ops.Floor: fixed_arity(sa.func._ibis_sqlite_floor, 1),
+    ops.Ceil: fixed_arity(sa.func._ibis_sqlite_ceil, 1),
+    ops.Sign: fixed_arity(sa.func._ibis_sqlite_sign, 1),
+    ops.FloorDivide: fixed_arity(sa.func._ibis_sqlite_floordiv, 2),
+
+    ops.Variance: _variance_reduction('_ibis_sqlite_var'),
+    ops.StandardDev: toolz.compose(
+        sa.func._ibis_sqlite_sqrt,
+        _variance_reduction('_ibis_sqlite_var')
+    ),
 })
 
 

@@ -13,27 +13,46 @@
 # limitations under the License.
 
 import re
+import datetime
+import itertools
 
 from collections import namedtuple, OrderedDict
 
 import six
 
-import ibis.expr.types as ir
+import numpy as np
+
+import toolz
+
+import ibis
 import ibis.common as com
 import ibis.util as util
+
+from ibis.compat import builtins, PY2
 
 
 class Schema(object):
 
+    """An object for holding table schema information, i.e., column names and
+    types.
+
+    Parameters
+    ----------
+    names : Sequence[str]
+        A sequence of ``str`` indicating the name of each column.
+    types : Sequence[DataType]
+        A sequence of :class:`ibis.expr.datatypes.DataType` objects
+        representing type of each column.
     """
-    Holds table schema information
-    """
+
+    __slots__ = 'names', 'types', '_name_locs'
 
     def __init__(self, names, types):
         if not isinstance(names, list):
             names = list(names)
+
         self.names = names
-        self.types = [validate_type(x) for x in types]
+        self.types = [validate_type(typ) for typ in types]
 
         self._name_locs = dict((v, i) for i, v in enumerate(self.names))
 
@@ -42,15 +61,18 @@ class Schema(object):
 
     def __repr__(self):
         space = 2 + max(map(len, self.names))
-        return "ibis.Schema {{{0}\n}}".format(
+        return "ibis.Schema {{{}\n}}".format(
             util.indent(
                 ''.join(
-                    '\n{0}{1}'.format(name.ljust(space), str(tipo))
-                    for name, tipo in zip(self.names, self.types)
+                    '\n{}{}'.format(name.ljust(space), str(type))
+                    for name, type in zip(self.names, self.types)
                 ),
                 2
             )
         )
+
+    def __hash__(self):
+        return hash((type(self), tuple(self.names), tuple(self.types)))
 
     def __len__(self):
         return len(self.names)
@@ -63,6 +85,16 @@ class Schema(object):
 
     def __getitem__(self, name):
         return self.types[self._name_locs[name]]
+
+    if PY2:
+        def __getstate__(self):
+            return {
+                slot: getattr(self, slot) for slot in self.__class__.__slots__
+            }
+
+        def __setstate__(self, instance_dict):
+            for key, value in instance_dict.items():
+                setattr(self, key, value)
 
     def delete(self, names_to_delete):
         for name in names_to_delete:
@@ -83,17 +115,12 @@ class Schema(object):
         if not isinstance(values, (list, tuple)):
             values = list(values)
 
-        if len(values):
-            names, types = zip(*values)
-        else:
-            names, types = [], []
+        names, types = zip(*values) if values else ([], [])
         return Schema(names, types)
 
     @classmethod
-    def from_dict(cls, values):
-        names = list(values.keys())
-        types = values.values()
-        return Schema(names, types)
+    def from_dict(cls, dictionary):
+        return Schema(*zip(*dictionary.items()))
 
     def equals(self, other, cache=None):
         return self.names == other.names and self.types == other.types
@@ -101,16 +128,23 @@ class Schema(object):
     def __eq__(self, other):
         return self.equals(other)
 
-    def get_type(self, name):
-        return self.types[self._name_locs[name]]
-
     def append(self, schema):
-        names = self.names + schema.names
-        types = self.types + schema.types
-        return Schema(names, types)
+        return Schema(self.names + schema.names, self.types + schema.types)
 
     def items(self):
         return zip(self.names, self.types)
+
+    def name_at_position(self, i):
+        """
+        """
+        upper = len(self.names) - 1
+        if not 0 <= i <= upper:
+            raise ValueError(
+                'Column index must be between 0 and {:d}, inclusive'.format(
+                    upper
+                )
+            )
+        return self.names[i]
 
 
 class HasSchema(object):
@@ -124,40 +158,31 @@ class HasSchema(object):
     """
 
     def __init__(self, schema, name=None):
-        assert isinstance(schema, Schema)
-        self._schema = schema
-        self._name = name
+        if not isinstance(schema, Schema):
+            raise TypeError(
+                'schema argument to HasSchema class must be a Schema instance'
+            )
+        self.schema = schema
+        self.name = name
 
     def __repr__(self):
-        return self._repr()
-
-    def _repr(self):
-        return "%s(%s)" % (type(self).__name__, repr(self.schema))
-
-    @property
-    def schema(self):
-        return self._schema
-
-    def get_schema(self):
-        return self._schema
+        return '{}({})'.format(type(self).__name__, repr(self.schema))
 
     def has_schema(self):
         return True
 
-    @property
-    def name(self):
-        return self._name
-
     def equals(self, other, cache=None):
-        if type(self) != type(other):
-            return False
-        return self.schema.equals(other.schema, cache=cache)
+        return type(self) == type(other) and self.schema.equals(
+            other.schema, cache=cache
+        )
 
     def root_tables(self):
         return [self]
 
 
 class DataType(object):
+
+    __slots__ = 'nullable',
 
     def __init__(self, nullable=True):
         self.nullable = nullable
@@ -172,87 +197,246 @@ class DataType(object):
         return self.equals(other)
 
     def __ne__(self, other):
-        return not (self == other)
+        return not self.__eq__(other)
 
     def __hash__(self):
-        return hash(type(self))
+        custom_parts = tuple(
+            getattr(self, slot)
+            for slot in toolz.unique(self.__slots__ + ('nullable',))
+        )
+        return hash((type(self),) + custom_parts)
 
     def __repr__(self):
-        name = self.name.lower()
-        if not self.nullable:
-            name = '{0}[non-nullable]'.format(name)
-        return name
+        return '{}({})'.format(
+            self.name,
+            ', '.join(
+                '{}={!r}'.format(slot, getattr(self, slot))
+                for slot in toolz.unique(self.__slots__ + ('nullable',))
+            )
+        )
+
+    if PY2:
+        def __getstate__(self):
+            return {
+                slot: getattr(self, slot)
+                for slot in toolz.unique(self.__slots__ + ('nullable',))
+            }
+
+        def __setstate__(self, instance_dict):
+            for key, value in instance_dict.items():
+                setattr(self, key, value)
+
+    def __str__(self):
+        return self.name.lower()
 
     @property
     def name(self):
         return type(self).__name__
 
+    def issubtype(self, other, cache=None):
+        return isinstance(other, Any) or isinstance(self, type(other))
+
     def equals(self, other, cache=None):
         if isinstance(other, six.string_types):
             other = validate_type(other)
 
-        return (isinstance(other, type(self)) and
-                self.nullable == other.nullable)
+        return (
+            isinstance(other, type(self)) and
+            self.nullable == other.nullable and
+            self._equal_part(other, cache=cache)
+        )
+
+    def _equal_part(self, other, cache=None):
+        return True
 
     def can_implicit_cast(self, other):
-        return self.equals(other)
+        return self.issubtype(other)
 
     def scalar_type(self):
-        name = type(self).__name__
-        return getattr(ir, '{0}Scalar'.format(name))
+        import ibis.expr.types as ir
+        return getattr(ir, '{}Scalar'.format(self.name))
 
     def array_type(self):
-        name = type(self).__name__
-        return getattr(ir, '{0}Array'.format(name))
+        import ibis.expr.types as ir
+        return getattr(ir, '{}Column'.format(self.name))
+
+    def valid_literal(self, value):
+        raise NotImplementedError(
+            'valid_literal not implemented for datatype {}'.format(
+                type(self).__name__
+            )
+        )
 
 
 class Any(DataType):
-    pass
+
+    __slots__ = ()
+
+    def valid_literal(self, value):
+        return True
 
 
 class Primitive(DataType):
-    pass
+
+    __slots__ = ()
+
+    def __repr__(self):
+        name = self.name.lower()
+        if not self.nullable:
+            return '{}[non-nullable]'.format(name)
+        return name
 
 
 class Null(DataType):
-    pass
+
+    __slots__ = ()
+
+    def valid_literal(self, value):
+        return value is None or value is ibis.null
 
 
 class Variadic(DataType):
-    pass
+
+    __slots__ = ()
 
 
 class Boolean(Primitive):
-    pass
+
+    __slots__ = ()
+
+    def valid_literal(self, value):
+        return isinstance(value, bool) or (
+            isinstance(value, six.integer_types + (np.integer,)) and
+            (value == 0 or value == 1)
+        )
+
+
+Bounds = namedtuple('Bounds', ('lower', 'upper'))
 
 
 class Integer(Primitive):
 
+    __slots__ = ()
+
+    @property
+    def bounds(self):
+        exp = self._nbytes * 8 - 1
+        lower = -1 << exp
+        return Bounds(lower=lower, upper=~lower)
+
     def can_implicit_cast(self, other):
-        if isinstance(other, Integer):
-            return ((type(self) == Integer) or
-                    (other._nbytes <= self._nbytes))
-        else:
-            return False
+        return (
+            isinstance(other, Integer) and
+            (type(self) is Integer or other._nbytes <= self._nbytes)
+        )
+
+    def valid_literal(self, value):
+        lower, upper = self.bounds
+        return isinstance(
+            value, six.integer_types + (np.integer,)
+        ) and lower <= value <= upper
 
 
 class String(Variadic):
-    pass
+    """A type representing a string.
+
+    Notes
+    -----
+    Because of differences in the way different backends handle strings, we
+    cannot assume that strings are UTF-8 encoded.
+    """
+
+    __slots__ = ()
+
+    def valid_literal(self, value):
+        return isinstance(value, six.string_types)
+
+
+class Binary(Variadic):
+    """A type representing a blob of bytes.
+
+    Notes
+    -----
+    Some databases treat strings and blobs of equally, and some do not. For
+    example, Impala doesn't make a distinction between string and binary types
+    but PostgreSQL has a TEXT type and a BYTEA type which are distinct types
+    that behave differently.
+    """
+
+    def valid_literal(self, value):
+        return isinstance(value, six.binary_type)
 
 
 class Date(Primitive):
-    pass
+
+    __slots__ = ()
+
+    def valid_literal(self, value):
+        return isinstance(value, six.string_types + (datetime.date,))
 
 
+class Time(Primitive):
+
+    __slots__ = ()
+
+    def valid_literal(self, value):
+        return isinstance(value, six.string_types + (datetime.time,))
+
+
+def parametric(cls):
+    type_name = cls.__name__
+    array_type_name = '{}Column'.format(type_name)
+    scalar_type_name = '{}Scalar'.format(type_name)
+
+    def array_type(self):
+        def constructor(op, name=None):
+            import ibis.expr.types as ir
+            return getattr(ir, array_type_name)(op, self, name=name)
+        return constructor
+
+    def scalar_type(self):
+        def constructor(op, name=None):
+            import ibis.expr.types as ir
+            return getattr(ir, scalar_type_name)(op, self, name=name)
+        return constructor
+
+    cls.array_type = array_type
+    cls.scalar_type = scalar_type
+    return cls
+
+
+@parametric
 class Timestamp(Primitive):
-    pass
 
+    __slots__ = 'timezone',
 
-class SignedInteger(Integer):
-    pass
+    def __init__(self, timezone=None, nullable=True):
+        super(Timestamp, self).__init__(nullable=nullable)
+        self.timezone = timezone
+
+    def _equal_part(self, other, cache=None):
+        return self.timezone == other.timezone
+
+    def __call__(self, timezone=None, nullable=True):
+        return type(self)(timezone=timezone, nullable=nullable)
+
+    def __str__(self):
+        timezone = self.timezone
+        typename = self.name.lower()
+        if timezone is None:
+            return typename
+        return '{}({!r})'.format(typename, timezone)
+
+    def __repr__(self):
+        return DataType.__repr__(self)
+
+    def valid_literal(self, value):
+        return isinstance(value, six.string_types + (datetime.datetime,))
 
 
 class Floating(Primitive):
+
+    __slots__ = ()
 
     def can_implicit_cast(self, other):
         if isinstance(other, Integer):
@@ -263,224 +447,260 @@ class Floating(Primitive):
         else:
             return False
 
+    def valid_literal(self, value):
+        valid_floating_types = (
+            builtins.float, np.floating, np.integer
+        ) + six.integer_types
+        return isinstance(value, valid_floating_types)
+
 
 class Int8(Integer):
 
+    __slots__ = ()
+
     _nbytes = 1
-    bounds = (-128, 127)
 
 
 class Int16(Integer):
 
+    __slots__ = ()
+
     _nbytes = 2
-    bounds = (-32768, 32767)
 
 
 class Int32(Integer):
 
+    __slots__ = ()
+
     _nbytes = 4
-    bounds = (-2147483648, 2147483647)
 
 
 class Int64(Integer):
 
+    __slots__ = ()
+
     _nbytes = 8
-    bounds = (-9223372036854775808, 9223372036854775807)
 
 
 class Float(Floating):
+
+    __slots__ = ()
 
     _nbytes = 4
 
 
 class Double(Floating):
 
+    __slots__ = ()
+
     _nbytes = 8
 
 
+@parametric
 class Decimal(DataType):
-    # Decimal types are parametric, we store the parameters in this object
+
+    __slots__ = 'precision', 'scale'
 
     def __init__(self, precision, scale, nullable=True):
+        super(Decimal, self).__init__(nullable=nullable)
         self.precision = precision
         self.scale = scale
-        DataType.__init__(self, nullable=nullable)
-
-    def _base_type(self):
-        return 'decimal'
-
-    def __repr__(self):
-        return '{0}(precision={1:d}, scale={2:d})'.format(
-            self.name,
-            self.precision,
-            self.scale,
-        )
 
     def __str__(self):
-        return '{0}({1:d}, {2:d})'.format(
+        return '{}({:d}, {:d})'.format(
             self.name.lower(),
             self.precision,
             self.scale,
         )
 
-    def __hash__(self):
-        return hash((self.precision, self.scale))
-
-    def __ne__(self, other):
-        return not self.__eq__(other)
-
-    def __eq__(self, other):
-        if not isinstance(other, Decimal):
-            return False
-
-        return (self.precision == other.precision and
-                self.scale == other.scale)
+    def _equal_part(self, other, cache=None):
+        return self.precision == other.precision and self.scale == other.scale
 
     @classmethod
     def can_implicit_cast(cls, other):
         return isinstance(other, (Floating, Decimal))
 
-    def array_type(self):
-        def constructor(op, name=None):
-            from ibis.expr.types import DecimalArray
-            return DecimalArray(op, self, name=name)
-        return constructor
 
-    def scalar_type(self):
-        def constructor(op, name=None):
-            from ibis.expr.types import DecimalScalar
-            return DecimalScalar(op, self, name=name)
-        return constructor
+assert hasattr(Decimal, '__hash__')
 
 
+@parametric
 class Category(DataType):
 
-    def __init__(self, cardinality=None, nullable=True):
-        self.cardinality = cardinality
-        DataType.__init__(self, nullable=nullable)
+    __slots__ = 'cardinality',
 
-    def _base_type(self):
-        return 'category'
+    def __init__(self, cardinality=None, nullable=True):
+        super(Category, self).__init__(nullable=nullable)
+        self.cardinality = cardinality
 
     def __repr__(self):
-        card = (self.cardinality if self.cardinality is not None
-                else 'unknown')
-        return ('category(K=%s)' % card)
+        if self.cardinality is not None:
+            cardinality = self.cardinality
+        else:
+            cardinality = 'unknown'
+        return '{}(cardinality={!r})'.format(self.name, cardinality)
 
-    def __hash__(self):
-        return hash(self.cardinality)
-
-    def __eq__(self, other):
-        if not isinstance(other, Category):
-            return False
-
-        return self.cardinality == other.cardinality
+    def _equal_part(self, other, cache=None):
+        return (
+            self.cardinality == other.cardinality and
+            self.nullable == other.nullable
+        )
 
     def to_integer_type(self):
-        if self.cardinality is None:
-            return 'int64'
-        elif self.cardinality < (2 ** 7 - 1):
-            return 'int8'
-        elif self.cardinality < (2 ** 15 - 1):
-            return 'int16'
-        elif self.cardinality < (2 ** 31 - 1):
-            return 'int32'
+        cardinality = self.cardinality
+
+        if cardinality is None:
+            return int64
+        elif cardinality < int8.bounds.upper:
+            return int8
+        elif cardinality < int16.bounds.upper:
+            return int16
+        elif cardinality < int32.bounds.upper:
+            return int32
         else:
-            return 'int64'
-
-    def array_type(self):
-        def constructor(op, name=None):
-            from ibis.expr.types import CategoryArray
-            return CategoryArray(op, self, name=name)
-        return constructor
-
-    def scalar_type(self):
-        def constructor(op, name=None):
-            from ibis.expr.types import CategoryScalar
-            return CategoryScalar(op, self, name=name)
-        return constructor
+            return int64
 
 
+@parametric
 class Struct(DataType):
 
+    __slots__ = 'pairs',
+
     def __init__(self, names, types, nullable=True):
+        """Construct a ``Struct`` type from a `names` and `types`.
+
+        Parameters
+        ----------
+        names : Sequence[str]
+            Sequence of strings indicating the name of each field in the
+            struct.
+        types : Sequence[Union[str, DataType]]
+            Sequence of strings or :class:`~ibis.expr.datatypes.DataType`
+            instances, one for each field
+        nullable : bool, optional
+            Whether the struct can be null
+        """
+        if len(names) != len(types):
+            raise ValueError('names and types must have the same length')
+
         super(Struct, self).__init__(nullable=nullable)
-        self.names = names
-        self.types = types
-
-    def __repr__(self):
-        return '{0}({1})'.format(
-            self.name,
-            list(zip(self.names, self.types))
-        )
-
-    def __str__(self):
-        return '{0}<{1}>'.format(
-            self.name.lower(),
-            ', '.join(
-                '{0}: {1}'.format(n, t) for n, t in zip(self.names, self.types)
-            )
-        )
-
-    def __eq__(self, other):
-        return isinstance(other, type(self)) and self.names == other.names and self.types == other.types
+        self.pairs = OrderedDict(zip(names, types))
 
     @classmethod
     def from_tuples(self, pairs):
         return Struct(*map(list, zip(*pairs)))
 
+    @property
+    def names(self):
+        return self.pairs.keys()
 
-class Array(Variadic):
+    @property
+    def types(self):
+        return self.pairs.values()
 
-    def __init__(self, value_type, nullable=True):
-        super(Array, self).__init__(nullable=nullable)
-        self.value_type = value_type
+    def __getitem__(self, key):
+        return self.pairs[key]
 
-    def __repr__(self):
-        return '{0}({1})'.format(self.name, repr(self.value_type))
-
-    def __str__(self):
-        return '{0}<{1}>'.format(self.name.lower(), self.value_type)
-
-    def __eq__(self, other):
-        return isinstance(other, type(self)) and self.value_type == other.value_type
-
-
-class Enum(DataType):
-
-    def __init__(self, rep_type, value_type, nullable=True):
-        super(Enum, self).__init__(nullable=nullable)
-        self.rep_type = rep_type
-        self.value_type = value_type
-
-
-class Map(DataType):
-
-    def __init__(self, key_type, value_type, nullable=True):
-        super(Map, self).__init__(nullable=nullable)
-        self.key_type = key_type
-        self.value_type = value_type
+    def __hash__(self):
+        return hash((
+            type(self), tuple(self.names), tuple(self.types), self.nullable
+        ))
 
     def __repr__(self):
-        return '{0}({1}, {2})'.format(
-            self.name,
-            repr(self.key_type),
-            repr(self.value_type),
+        return '{}({}, nullable={})'.format(
+            self.name, list(self.pairs.items()), self.nullable
         )
 
     def __str__(self):
-        return '{0}<{1}, {2}>'.format(
+        return '{}<{}>'.format(
+            self.name.lower(),
+            ', '.join(itertools.starmap('{}: {}'.format, self.pairs.items()))
+        )
+
+    def _equal_part(self, other, cache=None):
+        return self.names == other.names and (
+            left.equals(right, cache=cache)
+            for left, right in zip(self.types, other.types)
+        )
+
+    def valid_literal(self, value):
+        """Return whether the type of `value` is a Python literal type
+        that can be represented by an ibis ``Struct`` type.
+
+        Parameters
+        ----------
+        value : object
+            Any Python object
+
+        Returns
+        -------
+        is_valid : bool
+            Whether `value` can be used to represent an ibis ``Struct``.
+        """
+        return isinstance(value, OrderedDict)
+
+
+@parametric
+class Array(Variadic):
+
+    __slots__ = 'value_type',
+
+    def __init__(self, value_type, nullable=True):
+        super(Array, self).__init__(nullable=nullable)
+        self.value_type = validate_type(value_type)
+
+    def __str__(self):
+        return '{}<{}>'.format(self.name.lower(), self.value_type)
+
+    def _equal_part(self, other, cache=None):
+        return self.value_type.equals(other.value_type, cache=cache)
+
+    def valid_literal(self, value):
+        return isinstance(value, list)
+
+
+@parametric
+class Enum(DataType):
+
+    __slots__ = 'rep_type', 'value_type'
+
+    def __init__(self, rep_type, value_type, nullable=True):
+        super(Enum, self).__init__(nullable=nullable)
+        self.rep_type = validate_type(rep_type)
+        self.value_type = validate_type(value_type)
+
+    def _equal_part(self, other, cache=None):
+        return (
+            self.rep_type.equals(other.rep_type, cache=cache) and
+            self.value_type.equals(other.value_type, cache=cache)
+        )
+
+
+@parametric
+class Map(Variadic):
+
+    __slots__ = 'key_type', 'value_type'
+
+    def __init__(self, key_type, value_type, nullable=True):
+        super(Map, self).__init__(nullable=nullable)
+        self.key_type = validate_type(key_type)
+        self.value_type = validate_type(value_type)
+
+    def __str__(self):
+        return '{}<{}, {}>'.format(
             self.name.lower(),
             self.key_type,
             self.value_type,
         )
 
-    def __eq__(self, other):
+    def _equal_part(self, other, cache=None):
         return (
-            isinstance(other, type(self)) and
-            self.key_type == other.key_type and
-            self.value_type == other.value_type
+            self.key_type.equals(other.key_type, cache=cache) and
+            self.value_type.equals(other.value_type, cache=cache)
         )
+
+    def valid_literal(self, value):
+        return isinstance(value, dict)
 
 
 # ---------------------------------------------------------------------
@@ -496,7 +716,9 @@ int64 = Int64()
 float = Float()
 double = Double()
 string = String()
+binary = Binary()
 date = Date()
+time = Time()
 timestamp = Timestamp()
 
 
@@ -511,7 +733,9 @@ _primitive_types = {
     'float': float,
     'double': double,
     'string': string,
+    'binary': binary,
     'date': date,
+    'time': time,
     'timestamp': timestamp
 }
 
@@ -538,6 +762,9 @@ class Tokens(object):
     RPAREN = 14
     LBRACKET = 15
     RBRACKET = 16
+    TIMEZONE = 17
+    TIMESTAMP = 18
+    TIME = 19
 
     @staticmethod
     def name(value):
@@ -553,6 +780,10 @@ _token_names = dict(
 Token = namedtuple('Token', ('type', 'value'))
 
 
+# Adapted from tokenize.String
+_STRING_REGEX = """('[^\n'\\\\]*(?:\\\\.[^\n'\\\\]*)*'|"[^\n"\\\\"]*(?:\\\\.[^\n"\\\\]*)*")"""  # noqa: E501
+
+
 _TYPE_RULES = OrderedDict(
     [
         # any, null
@@ -564,7 +795,19 @@ _TYPE_RULES = OrderedDict(
             '(?P<{}>{})'.format(token.upper(), token),
             lambda token, value=value: Token(Tokens.PRIMITIVE, value)
         ) for token, value in _primitive_types.items()
-        if token != 'any' and token != 'null'
+        if token not in {'any', 'null', 'timestamp', 'time'}
+    ] + [
+        # timestamp
+        (
+            r'(?P<TIMESTAMP>timestamp)',
+            lambda token: Token(Tokens.TIMESTAMP, token),
+        ),
+    ] + [
+        # time
+        (
+            r'(?P<TIME>time)',
+            lambda token: Token(Tokens.TIME, token),
+        ),
     ] + [
         # decimal + complex types
         (
@@ -582,7 +825,7 @@ _TYPE_RULES = OrderedDict(
             ),
         )
     ] + [
-        # numbers, for decimal spec
+        # integers, for decimal spec
         (r'(?P<INTEGER>\d+)', lambda token: Token(Tokens.INTEGER, int(token))),
 
         # struct fields
@@ -590,6 +833,7 @@ _TYPE_RULES = OrderedDict(
             r'(?P<FIELD>[a-zA-Z_][a-zA-Z_0-9]*)',
             lambda token: Token(Tokens.FIELD, token)
         ),
+        # timezones
         ('(?P<COMMA>,)', lambda token: Token(Tokens.COMMA, token)),
         ('(?P<COLON>:)', lambda token: Token(Tokens.COLON, token)),
         (r'(?P<LPAREN>\()', lambda token: Token(Tokens.LPAREN, token)),
@@ -597,6 +841,10 @@ _TYPE_RULES = OrderedDict(
         ('(?P<LBRACKET><)', lambda token: Token(Tokens.LBRACKET, token)),
         ('(?P<RBRACKET>>)', lambda token: Token(Tokens.RBRACKET, token)),
         (r'(?P<WHITESPACE>\s+)', None),
+        (
+            '(?P<TIMEZONE>{})'.format(_STRING_REGEX),
+            lambda token: Token(Tokens.TIMEZONE, token),
+        ),
     ]
 )
 
@@ -637,6 +885,8 @@ class TypeParser(object):
     Adapted from David Beazley's and Brian Jones's Python Cookbook
     """
 
+    __slots__ = 'text', 'tokens', 'tok', 'nexttok'
+
     def __init__(self, text):
         self.text = text
         self.tokens = _generate_tokens(_TYPE_PATTERN, text)
@@ -654,7 +904,7 @@ class TypeParser(object):
 
     def _expect(self, toktype):
         if not self._accept(toktype):
-            raise SyntaxError('Expected {0} after {1!r} in {2!r}'.format(
+            raise SyntaxError('Expected {} after {!r} in {!r}'.format(
                 Tokens.name(toktype),
                 self.tok.value,
                 self.text,
@@ -677,7 +927,7 @@ class TypeParser(object):
                 additional_tokens.append(self.nexttok.value)
                 self._advance()
             raise SyntaxError(
-                'Found additional tokens {0}'.format(additional_tokens)
+                'Found additional tokens {}'.format(additional_tokens)
             )
 
     def type(self):
@@ -698,7 +948,11 @@ class TypeParser(object):
                   | "float"
                   | "double"
                   | "string"
-                  | "timestamp"
+                  | "time"
+                  | timestamp
+
+        timestamp : "timestamp"
+                  | "timestamp" "(" timezone ")"
 
         decimal : "decimal"
                 | "decimal" "(" integer "," integer ")"
@@ -715,6 +969,17 @@ class TypeParser(object):
         """
         if self._accept(Tokens.PRIMITIVE):
             return self.tok.value
+
+        elif self._accept(Tokens.TIMESTAMP):
+            if self._accept(Tokens.LPAREN):
+                self._expect(Tokens.TIMEZONE)
+                timezone = self.tok.value[1:-1]  # remove surrounding quotes
+                self._expect(Tokens.RPAREN)
+                return Timestamp(timezone=timezone)
+            return timestamp
+
+        elif self._accept(Tokens.TIME):
+            return Time()
 
         elif self._accept(Tokens.DECIMAL):
             if self._accept(Tokens.LPAREN):
@@ -784,13 +1049,15 @@ class TypeParser(object):
             self._expect(Tokens.RBRACKET)
             return Struct(names, types)
         else:
-            raise SyntaxError('Type cannot be parsed: {0}'.format(self.text))
+            raise SyntaxError('Type cannot be parsed: {}'.format(self.text))
 
 
 def validate_type(t):
     if isinstance(t, DataType):
         return t
-    return TypeParser(t).parse()
+    elif isinstance(t, six.string_types):
+        return TypeParser(t).parse()
+    raise TypeError('Value {!r} is not a valid type or string'.format(t))
 
 
 def array_type(t):

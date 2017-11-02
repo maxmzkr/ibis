@@ -1,4 +1,8 @@
-import queue as q
+try:
+    import queue as q
+except ImportError:
+    import Queue as q  # noqa
+
 from itertools import chain
 from toolz import identity
 from collections import deque
@@ -14,7 +18,8 @@ def roots(expr, types=(ops.PhysicalTable,)):
     ----------
     expr : Expr
         The expression to analyze
-    types : tuple(type), optional, default (:mod:`ibis.expr.operations.PhysicalTable`,)
+    types : tuple(type), optional, default
+            (:mod:`ibis.expr.operations.PhysicalTable`,)
         The node types to traverse
 
     Yields
@@ -115,7 +120,7 @@ def _get_args(op, name):
         return [col for col in result if col._name == name]
     elif isinstance(op, ops.Aggregation):
         assert name is not None, 'name is None'
-        return [col for col in chain(op.by, op.agg_exprs) if col._name == name]
+        return [col for col in chain(op.by, op.metrics) if col._name == name]
     else:
         return op.args
 
@@ -128,7 +133,7 @@ def lineage(expr, container=Stack):
     ----------
     expr : Expr
         An ibis expression. It must be an instance of
-        :class:`ibis.expr.types.ArrayExpr`.
+        :class:`ibis.expr.types.ColumnExpr`.
     container : Container, {Stack, Queue}
         Stack for depth-first traversal, and Queue for breadth-first.
         Depth-first will reach root table nodes before continuing on to other
@@ -141,8 +146,8 @@ def lineage(expr, container=Stack):
     node : Expr
         A column and its dependencies
     """
-    if not isinstance(expr, ir.ArrayExpr):
-        raise TypeError('Input expression must be an instance of ArrayExpr')
+    if not isinstance(expr, ir.ColumnExpr):
+        raise TypeError('Input expression must be an instance of ColumnExpr')
 
     c = container([(expr, expr._name)])
 

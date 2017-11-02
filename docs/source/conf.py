@@ -13,14 +13,10 @@
 # serve to show the default.
 
 import glob
-import sys
-import os
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
-
-sys.path.insert(0, os.path.abspath('../sphinxext'))
 
 # -- General configuration ------------------------------------------------
 
@@ -32,19 +28,19 @@ sys.path.insert(0, os.path.abspath('../sphinxext'))
 # ones.
 extensions = [
     'sphinx.ext.autodoc',
-    'sphinx.ext.mathjax',
     'sphinx.ext.autosummary',
+    'sphinx.ext.extlinks',
+    'sphinx.ext.mathjax',
     'numpydoc',
 
-    'ipython_sphinxext.ipython_directive',
-    'ipython_sphinxext.ipython_console_highlighting',
+    'IPython.sphinxext.ipython_directive',
+    'IPython.sphinxext.ipython_console_highlighting',
 ]
 
 autosummary_generate = glob.glob("*.rst")
 
 # autosummary_generate = True
 
-import numpydoc
 numpydoc_show_class_members = False
 
 # Add any paths that contain templates here, relative to this directory.
@@ -242,6 +238,10 @@ latex_documents = [
 
 # If false, no module index is generated.
 #latex_domain_indices = True
+
+
+# extlinks alias
+extlinks = {'issue': ('https://github.com/ibis-project/ibis/issues/%s', '#')}
 
 
 # -- Options for manual page output ---------------------------------------

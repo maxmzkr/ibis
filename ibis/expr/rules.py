@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+import functools
+import operator
+
 from collections import Counter
 
-import operator
+import six
 
 from toolz import first
 
 from ibis.common import IbisTypeError
-from ibis.compat import py_string
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 import ibis.common as com
@@ -42,17 +45,24 @@ class BinaryPromoter(object):
         return shape_like_args(self.args, promoted_type)
 
     def _get_type(self):
-        if util.any_of(self.args, ir.FloatingValue):
+        if util.any_of(self.args, ir.DecimalValue):
+            return _decimal_promoted_type(self.args)
+        elif util.any_of(self.args, ir.FloatingValue):
             if util.any_of(self.args, ir.DoubleValue):
                 return 'double'
             else:
                 return 'float'
         elif util.all_of(self.args, ir.IntegerValue):
             return self._get_int_type()
-        elif util.any_of(self.args, ir.DecimalValue):
-            return _decimal_promoted_type(self.args)
+        elif self.left.type().equals(self.right.type()):
+            return self.left.type()
         else:
-            raise NotImplementedError
+            raise NotImplementedError(
+                'Operands {}, {} not supported for binary operation {}'.format(
+                    type(self.left).__name__, type(self.right).__name__,
+                    self.op.__name__
+                )
+            )
 
     def _get_int_type(self):
         deps = [x.op() for x in self.args]
@@ -79,13 +89,12 @@ class BinaryPromoter(object):
 
 
 def _decimal_promoted_type(args):
-    precisions = []
-    scales = []
+    max_precision = max_scale = ~sys.maxsize
     for arg in args:
         if isinstance(arg, ir.DecimalValue):
-            precisions.append(arg.meta.precision)
-            scales.append(arg.meta.scale)
-    return dt.Decimal(max(precisions), max(scales))
+            max_precision = max(max_precision, arg.meta.precision)
+            max_scale = max(max_scale, arg.meta.scale)
+    return dt.Decimal(max_precision, max_precision)
 
 
 class PowerPromoter(BinaryPromoter):
@@ -108,7 +117,12 @@ class PowerPromoter(BinaryPromoter):
         elif util.all_of(self.args, ir.IntegerValue):
             return self._get_int_type()
         else:
-            raise NotImplementedError
+            raise NotImplementedError(
+                'Operands {}, {} not supported for binary operation {}'.format(
+                    type(self.left).__name__, type(self.right).__name__,
+                    self.op.__name__
+                )
+            )
 
 
 # Impala type precedence (more complex in other database implementations)
@@ -122,21 +136,60 @@ class PowerPromoter(BinaryPromoter):
 # tinyint
 # boolean
 # string
+# binary
 
 
-_TYPE_PRECEDENCE = {
-    'timestamp': 10,
-    'double': 9,
-    'float': 8,
-    'decimal': 7,
-    'int64': 6,
-    'int32': 5,
-    'int16': 4,
-    'int8': 3,
-    'boolean': 2,
-    'string': 1,
-    'null': 0
+_SCALAR_TYPE_PRECEDENCE = {
+    'timestamp': 11,
+    'double': 10,
+    'float': 9,
+    'decimal': 8,
+    'int64': 7,
+    'int32': 6,
+    'int16': 5,
+    'int8': 4,
+    'boolean': 3,
+    'string': 2,
+    'binary': 1,
+    'null': 0,
 }
+
+
+def higher_precedence(left, right):
+    left_name = left.name.lower()
+    right_name = right.name.lower()
+
+    if (left_name in _SCALAR_TYPE_PRECEDENCE and
+            right_name in _SCALAR_TYPE_PRECEDENCE):
+        left_prec = _SCALAR_TYPE_PRECEDENCE[left_name]
+        right_prec = _SCALAR_TYPE_PRECEDENCE[right_name]
+        _, highest_type = max(
+            ((left_prec, left), (right_prec, right)),
+            key=first
+        )
+        return highest_type
+
+    # TODO(phillipc): Ensure that left and right are API compatible
+
+    if isinstance(left, dt.Array):
+        return dt.Array(higher_precedence(left.value_type, right.value_type))
+
+    if isinstance(left, dt.Map):
+        return dt.Map(
+            higher_precedence(left.key_type, right.key_type),
+            higher_precedence(left.value_type, right.value_type)
+        )
+
+    if isinstance(left, dt.Struct):
+        if left.names != right.names:
+            raise TypeError('Struct names are not equal')
+        return dt.Struct(
+            left.names,
+            list(map(higher_precedence, left.types, right.types))
+        )
+    raise TypeError(
+        'Cannot compute precedence for {} and {} types'.format(left, right)
+    )
 
 
 def highest_precedence_type(exprs):
@@ -146,11 +199,8 @@ def highest_precedence_type(exprs):
     if not exprs:
         raise ValueError('Must pass at least one expression')
 
-    type_counts = Counter(expr.type() for expr in exprs)
-    scores = (
-        (_TYPE_PRECEDENCE[k.name.lower()], k) for k, v in type_counts.items()
-    )
-    _, highest_type = max(scores, key=first)
+    expr_types = {expr.type() for expr in exprs}
+    highest_type = functools.reduce(higher_precedence, expr_types)
 
     for expr in exprs:
         if not expr._can_cast_implicit(highest_type):
@@ -235,7 +285,7 @@ def shape_like(arg, out_type):
 
 def shape_like_args(args, out_type):
     out_type = dt.validate_type(out_type)
-    if util.any_of(args, ir.ArrayExpr):
+    if util.any_of(args, ir.ColumnExpr):
         return out_type.array_type()
     else:
         return out_type.scalar_type()
@@ -246,7 +296,7 @@ def is_table(e):
 
 
 def is_array(e):
-    return isinstance(e, ir.ArrayExpr)
+    return isinstance(e, ir.ColumnExpr)
 
 
 def is_scalar(e):
@@ -254,7 +304,7 @@ def is_scalar(e):
 
 
 def is_collection(expr):
-    return isinstance(expr, (ir.ArrayExpr, ir.TableExpr))
+    return isinstance(expr, (ir.ColumnExpr, ir.TableExpr))
 
 
 class Argument(object):
@@ -264,12 +314,13 @@ class Argument(object):
     """
 
     def __init__(self, name=None, default=None, optional=False,
-                 validator=None):
+                 validator=None, doc=None, as_value_expr=None):
         self.name = name
         self.default = default
         self.optional = optional
-
         self.validator = validator
+        self.doc = doc
+        self.as_value_expr = as_value_expr or ir.literal
 
     def validate(self, args, i):
         arg = args[i]
@@ -279,7 +330,7 @@ class Argument(object):
 
         if arg is None:
             if not self.optional:
-                return ir.as_value_expr(self.default)
+                return self.as_value_expr(self.default)
             elif self.optional:
                 return arg
 
@@ -443,7 +494,7 @@ class ValueArgument(Argument):
     def _validate(self, args, i):
         arg = args[i]
         if not isinstance(arg, ir.Expr):
-            arg = args[i] = ir.as_value_expr(arg)
+            arg = args[i] = self.as_value_expr(arg)
 
         return arg
 
@@ -451,15 +502,15 @@ class ValueArgument(Argument):
 class AnyTyped(Argument):
 
     def __init__(self, types, fail_message, **arg_kwds):
+        super(AnyTyped, self).__init__(**arg_kwds)
         self.types = util.promote_list(types)
         self.fail_message = fail_message
-        Argument.__init__(self, **arg_kwds)
 
     def _validate(self, args, i):
         arg = args[i]
 
         if not self._type_matches(arg):
-            if isinstance(self.fail_message, py_string):
+            if isinstance(self.fail_message, six.string_types):
                 exc = self.fail_message
             else:
                 exc = self.fail_message(self.types, arg)
@@ -482,18 +533,50 @@ class AnyTyped(Argument):
 class ValueTyped(AnyTyped, ValueArgument):
 
     def __repr__(self):
-        return 'ValueTyped({0})'.format(repr(self.types))
+        return '{}({})'.format(type(self).__name__, repr(self.types))
 
     def _validate(self, args, i):
         ValueArgument._validate(self, args, i)
         return AnyTyped._validate(self, args, i)
 
 
+class ArrayValueTyped(ValueTyped):
+
+    def __init__(self, value_type, *args, **kwargs):
+        super(ArrayValueTyped, self).__init__(
+            dt.Array(value_type), *args, **kwargs
+        )
+
+    def _validate(self, args, i):
+        arg = super(ArrayValueTyped, self)._validate(args, i)
+        type, = self.types
+        arg_type = arg.type()
+        if (arg_type.equals(dt.Array(dt.any)) or
+                arg_type.equals(dt.Array(dt.null))):
+            return arg.cast(type)
+        return arg
+
+
+class MapValueTyped(ValueTyped):
+
+    def __init__(self, key_type, value_type, *args, **kwargs):
+        super(MapValueTyped, self).__init__(
+            dt.Map(key_type, value_type), *args, **kwargs
+        )
+
+    def _validate(self, args, i):
+        arg = super(MapValueTyped, self)._validate(args, i)
+        type, = self.types
+        if arg.type().equals(dt.Map(dt.any, dt.any)):
+            return arg.cast(type)
+        return arg
+
+
 class MultipleTypes(Argument):
 
     def __init__(self, types, **arg_kwds):
+        super(MultipleTypes, self).__init__(**arg_kwds)
         self.types = [_to_argument(t) for t in types]
-        Argument.__init__(self, **arg_kwds)
 
     def _validate(self, args, i):
         for t in self.types:
@@ -504,18 +587,18 @@ class MultipleTypes(Argument):
 class OneOf(Argument):
 
     def __init__(self, types, **arg_kwds):
+        super(OneOf, self).__init__(**arg_kwds)
         self.types = [_to_argument(t) for t in types]
-        Argument.__init__(self, **arg_kwds)
 
     def _validate(self, args, i):
         validated = False
         for t in self.types:
             try:
                 arg = t.validate(args, i)
-                validated = True
-            except:
+            except com.IbisTypeError:
                 pass
             else:
+                validated = True
                 break
 
         if not validated:
@@ -527,11 +610,11 @@ class OneOf(Argument):
 class CastIfDecimal(ValueArgument):
 
     def __init__(self, ref_j, **arg_kwds):
+        super(CastIfDecimal, self).__init__(**arg_kwds)
         self.ref_j = ref_j
-        ValueArgument.__init__(self, **arg_kwds)
 
     def _validate(self, args, i):
-        ValueArgument._validate(self, args, i)
+        super(CastIfDecimal, self)._validate(args, i)
 
         ref_arg = args[self.ref_j]
         if isinstance(ref_arg, ir.DecimalValue):
@@ -548,45 +631,41 @@ def value_typed_as(types, **arg_kwds):
     return ValueTyped(types, fail_message, **arg_kwds)
 
 
-def array(value_type=None, name=None, optional=False):
-    array_checker = ValueTyped(ir.ArrayExpr, 'not an array expr',
-                               name=name,
-                               optional=optional)
+def column(value_type=None, **arg_kwds):
+    array_checker = ValueTyped(ir.ColumnExpr, 'not a column expr', **arg_kwds)
     if value_type is None:
         return array_checker
     else:
-        return MultipleTypes([array_checker, value_type],
-                             name=name,
-                             optional=optional)
+        return MultipleTypes([array_checker, value_type], **arg_kwds)
 
 
-def scalar(name=None, optional=False):
-    return ValueTyped(ir.ScalarExpr, 'not a scalar expr', name=name,
-                      optional=optional)
+def scalar(value_type=None, **arg_kwds):
+    scalar_checker = ValueTyped(ir.ScalarExpr, 'not a scalar expr', **arg_kwds)
+    if value_type is None:
+        return scalar_checker
+    else:
+        return MultipleTypes([scalar_checker, value_type], **arg_kwds)
 
 
-def collection(name=None, optional=False):
-    return ValueTyped((ir.ArrayExpr, ir.TableExpr), 'not a collection',
-                      name=name, optional=optional)
+def collection(**arg_kwds):
+    return ValueTyped((ir.ColumnExpr, ir.TableExpr), 'not a collection',
+                      **arg_kwds)
 
 
-def value(name=None, optional=False):
-    return ValueTyped(ir.ValueExpr, 'not a value expr',
-                      name=name, optional=optional)
-
-
-def table(name=None):
-    pass
+def value(**arg_kwds):
+    return ValueTyped(ir.ValueExpr, 'not a value expr', **arg_kwds)
 
 
 class Number(ValueTyped):
 
     def __init__(self, allow_boolean=True, **arg_kwds):
+        super(Number, self).__init__(
+            ir.NumericValue, 'not numeric', **arg_kwds
+        )
         self.allow_boolean = allow_boolean
-        ValueTyped.__init__(self, ir.NumericValue, 'not numeric', **arg_kwds)
 
     def _validate(self, args, i):
-        arg = ValueTyped._validate(self, args, i)
+        arg = super(Number, self)._validate(args, i)
 
         if isinstance(arg, ir.BooleanValue) and not self.allow_boolean:
             raise IbisTypeError('not implemented for boolean values')
@@ -595,6 +674,19 @@ class Number(ValueTyped):
 
 
 number = Number
+
+
+def struct(**arg_kwds):
+    return ValueTyped(ir.StructValue, 'not struct', **arg_kwds)
+
+
+def map(key_type, value_type, **arg_kwds):
+    return MapValueTyped(
+        key_type,
+        value_type,
+        'not map<{}, {}>'.format(key_type, value_type),
+        **arg_kwds
+    )
 
 
 def integer(**arg_kwds):
@@ -606,11 +698,19 @@ def double(**arg_kwds):
 
 
 def decimal(**arg_kwds):
-    return ValueTyped(dt.Decimal, 'not decimal', **arg_kwds)
+    return ValueTyped(ir.DecimalValue, 'not decimal', **arg_kwds)
 
 
 def timestamp(**arg_kwds):
-    return ValueTyped(ir.TimestampValue, 'not decimal', **arg_kwds)
+    return ValueTyped(ir.TimestampValue, 'not timestamp', **arg_kwds)
+
+
+def date(**arg_kwds):
+    return ValueTyped(ir.DateValue, 'not date', **arg_kwds)
+
+
+def time(**arg_kwds):
+    return ValueTyped(ir.TimeValue, 'not time', **arg_kwds)
 
 
 def timedelta(**arg_kwds):
@@ -622,7 +722,28 @@ def string(**arg_kwds):
     return ValueTyped(dt.string, 'not string', **arg_kwds)
 
 
+def binary(**arg_kwds):
+    return ValueTyped(dt.binary, 'not binary', **arg_kwds)
+
+
+def array(value_type, **arg_kwds):
+    """Require that an expression is an Array type whose value_type is
+    `value_type`.
+
+    Parameters
+    ----------
+    value_type : ibis.expr.datatypes.DataType
+    """
+    return ArrayValueTyped(
+        value_type,
+        'not array with value_type {0}'.format(value_type),
+        **arg_kwds
+    )
+
+
 def boolean(**arg_kwds):
+    """Require that an expression has type boolean.
+    """
     return ValueTyped(dt.boolean, 'not string', **arg_kwds)
 
 
@@ -630,29 +751,101 @@ def one_of(args, **arg_kwds):
     return OneOf(args, **arg_kwds)
 
 
+temporal = one_of((dt.timestamp, dt.date, dt.time))
+
+
+def instance_of(type_, **arg_kwds):
+    """Require that a value has a particular Python type.
+
+    Parameters
+    ----------
+    type_ : Type
+
+    Returns
+    -------
+    rule : AnyTyped
+    """
+    return AnyTyped(type_, 'not a {}'.format(type_), **arg_kwds)
+
+
 class StringOptions(Argument):
 
-    def __init__(self, options, **arg_kwds):
-        self.options = options
-        Argument.__init__(self, **arg_kwds)
+    def __init__(self, options, case_sensitive=True, **arg_kwds):
+        super(StringOptions, self).__init__(**arg_kwds)
+        if not case_sensitive:
+            (is_lower, _), = Counter(
+                opt.islower() for opt in options
+            ).most_common(1)
+            self._preferred_case = str.lower if is_lower else str.upper
+            self.options = [
+                self._preferred_case(opt) for opt in options
+            ]
+        else:
+            self.options = options
+        self.case_sensitive = case_sensitive
 
     def _validate(self, args, i):
         arg = args[i]
+
+        if not self.case_sensitive:
+            arg = self._preferred_case(arg)
+
         if arg not in self.options:
-            raise IbisTypeError('{0} not among options {1}'
-                                .format(arg, repr(self.options)))
+            raise IbisTypeError(
+                '{} not among options {}'.format(arg, self.options)
+            )
         return arg
 
 
 string_options = StringOptions
 
 
+class Enum(Argument):
+    def __init__(self, enum, **arg_kwds):
+        super(Enum, self).__init__(**arg_kwds)
+        self.enum = enum
+
+    def _validate(self, args, i):
+        arg = args[i]
+
+        # if our passed value wasn't specified directly from the enum
+        if not isinstance(arg, self.enum):
+            value_set = {}
+            for key, value in self.enum.__members__.items():
+                value_set.setdefault(value.value, []).append(key)
+
+            # not in the value_set, so can't be valid
+            if arg not in value_set:
+                raise IbisTypeError(
+                    ('Value {} is not a member of the {} enum, '
+                     'whose values are {}').format(
+                         arg, self.enum.__name__, list(self.enum)
+                    )
+                )
+
+            # if it's in the value set and the value set has duplicates, then
+            # we can't validate it because we don't know which one the user
+            # meant
+            if len(value_set[arg]) > 1:
+                raise IbisTypeError(
+                    (
+                        'Value {0} is a member of {1}, but {1} is not unique. '
+                        'Please explicitly pass the desired enum attribute.'
+                    ).format(arg, self.enum.__name__)
+                )
+            return self.enum[value_set[arg].pop()]
+        return arg
+
+
+enum = Enum
+
+
 class ListOf(Argument):
 
     def __init__(self, value_type, min_length=0, **arg_kwds):
+        super(ListOf, self).__init__(**arg_kwds)
         self.value_type = _to_argument(value_type)
         self.min_length = min_length
-        Argument.__init__(self, **arg_kwds)
 
     def _validate(self, args, i):
         arg = args[i]
@@ -689,9 +882,6 @@ class DataTypeArgument(Argument):
 
     def _validate(self, args, i):
         arg = args[i]
-
-        if isinstance(arg, py_string):
-            arg = arg.lower()
 
         arg = args[i] = dt.validate_type(arg)
         return arg

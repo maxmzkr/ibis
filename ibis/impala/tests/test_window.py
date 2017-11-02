@@ -17,11 +17,24 @@ import pytest
 
 from ibis import window
 import ibis
-
-from ibis.impala.compiler import to_sql
-from ibis.compat import unittest
-from ibis.tests.util import assert_equal
 import ibis.common as com
+from ibis.tests.util import assert_equal
+
+pytest.importorskip('hdfs')
+pytest.importorskip('sqlalchemy')
+pytest.importorskip('impala.dbapi')
+
+from ibis.impala.compiler import to_sql  # noqa: E402
+from ibis.impala.tests.common import ImpalaE2E  # noqa: E402
+
+
+@pytest.yield_fixture(scope='module')
+def con(request):
+    try:
+        ImpalaE2E.setUpClass()
+        yield ImpalaE2E.con
+    finally:
+        ImpalaE2E.tearDownClass()
 
 
 def assert_sql_equal(expr, expected):
@@ -29,16 +42,18 @@ def assert_sql_equal(expr, expected):
     assert result == expected
 
 
+@pytest.mark.impala
 def test_aggregate_in_projection(con):
     t = con.table('alltypes')
     proj = t[t, (t.f / t.f.sum()).name('normed_f')]
 
     expected = """\
 SELECT *, `f` / sum(`f`) OVER () AS `normed_f`
-FROM alltypes"""
+FROM ibis_testing.`alltypes`"""
     assert_sql_equal(proj, expected)
 
 
+@pytest.mark.impala
 def test_add_default_order_by(con):
     t = con.table('alltypes')
 
@@ -55,10 +70,11 @@ SELECT *, lag(`f`) OVER (PARTITION BY `g` ORDER BY `f`) AS `lag`,
        first_value(`f`) OVER (PARTITION BY `g` ORDER BY `f`) AS `first`,
        last_value(`f`) OVER (PARTITION BY `g` ORDER BY `f`) AS `last`,
        lag(`f`) OVER (PARTITION BY `g` ORDER BY `d`) AS `lag2`
-FROM alltypes"""
+FROM ibis_testing.`alltypes`"""
     assert_sql_equal(proj, expected)
 
 
+@pytest.mark.impala
 @pytest.mark.parametrize(
     ['window', 'frame'],
     [
@@ -99,7 +115,7 @@ def test_window_frame_specs(con, window, frame):
 
     ex_template = """\
 SELECT sum(`d`) OVER (ORDER BY `f` {0}) AS `foo`
-FROM alltypes"""
+FROM ibis_testing.`alltypes`"""
 
     w2 = window.order_by(t.f)
     expr = t.projection([t.d.sum().over(w2).name('foo')])
@@ -107,6 +123,7 @@ FROM alltypes"""
     assert_sql_equal(expr, expected)
 
 
+@pytest.mark.impala
 def test_cumulative_functions(con):
     t = con.table('alltypes')
 
@@ -128,6 +145,7 @@ def test_cumulative_functions(con):
         assert to_sql(expr1) == to_sql(expr2)
 
 
+@pytest.mark.impala
 def test_nested_analytic_function(con):
     t = con.table('alltypes')
 
@@ -137,10 +155,11 @@ def test_nested_analytic_function(con):
     expected = """\
 SELECT lag(`f` - lag(`f`) OVER (ORDER BY `f`)) \
 OVER (ORDER BY `f`) AS `foo`
-FROM alltypes"""
+FROM ibis_testing.`alltypes`"""
     assert_sql_equal(result, expected)
 
 
+@pytest.mark.impala
 def test_rank_functions(con):
     t = con.table('alltypes')
 
@@ -149,10 +168,11 @@ def test_rank_functions(con):
     expected = """\
 SELECT `g`, (rank() OVER (ORDER BY `f`) - 1) AS `minr`,
        (dense_rank() OVER (ORDER BY `f`) - 1) AS `denser`
-FROM alltypes"""
+FROM ibis_testing.`alltypes`"""
     assert_sql_equal(proj, expected)
 
 
+@pytest.mark.impala
 def test_multiple_windows(con):
     t = con.table('alltypes')
 
@@ -163,10 +183,11 @@ def test_multiple_windows(con):
 
     expected = """\
 SELECT `g`, sum(`f`) OVER (PARTITION BY `g`) - sum(`f`) OVER () AS `result`
-FROM alltypes"""
+FROM ibis_testing.`alltypes`"""
     assert_sql_equal(proj, expected)
 
 
+@pytest.mark.impala
 def test_order_by_desc(con):
     t = con.table('alltypes')
 
@@ -175,7 +196,7 @@ def test_order_by_desc(con):
     proj = t[t.f, ibis.row_number().over(w).name('revrank')]
     expected = """\
 SELECT `f`, (row_number() OVER (ORDER BY `f` DESC) - 1) AS `revrank`
-FROM alltypes"""
+FROM ibis_testing.`alltypes`"""
     assert_sql_equal(proj, expected)
 
     expr = (t.group_by('g')
@@ -184,10 +205,11 @@ FROM alltypes"""
     expected = """\
 SELECT lag(`d`) OVER (PARTITION BY `g` ORDER BY `f` DESC) AS `foo`,
        max(`a`) OVER (PARTITION BY `g` ORDER BY `f` DESC) AS `max`
-FROM alltypes"""
+FROM ibis_testing.`alltypes`"""
     assert_sql_equal(expr, expected)
 
 
+@pytest.mark.impala
 def test_row_number_requires_order_by(con):
     t = con.table('alltypes')
 
@@ -201,10 +223,11 @@ def test_row_number_requires_order_by(con):
 
     expected = """\
 SELECT *, (row_number() OVER (PARTITION BY `g` ORDER BY `f`) - 1) AS `foo`
-FROM alltypes"""
+FROM ibis_testing.`alltypes`"""
     assert_sql_equal(expr, expected)
 
 
+@pytest.mark.impala
 def test_row_number_properly_composes_with_arithmetic(con):
     t = con.table('alltypes')
     w = ibis.window(order_by=t.f)
@@ -212,10 +235,11 @@ def test_row_number_properly_composes_with_arithmetic(con):
 
     expected = """\
 SELECT *, (row_number() OVER (ORDER BY `f`) - 1) / 2 AS `new`
-FROM alltypes"""
+FROM ibis_testing.`alltypes`"""
     assert_sql_equal(expr, expected)
 
 
+@pytest.mark.impala
 @pytest.mark.parametrize(
     ['column', 'op'],
     [
@@ -233,6 +257,7 @@ def test_unsupported_aggregate_functions(con, column, op):
         to_sql(proj)
 
 
+@pytest.mark.impala
 def test_propagate_nested_windows(con):
     # GH #469
     t = con.table('alltypes')
@@ -250,7 +275,7 @@ def test_propagate_nested_windows(con):
     expected = """\
 SELECT lag(`f` - lag(`f`) OVER (PARTITION BY `g` ORDER BY `f`)) \
 OVER (PARTITION BY `g` ORDER BY `f`) AS `foo`
-FROM alltypes"""
+FROM ibis_testing.`alltypes`"""
     assert_sql_equal(expr, expected)
 
 

@@ -14,6 +14,9 @@
 
 import numbers
 import operator
+import functools
+import contextlib
+
 import six
 
 import sqlalchemy as sa
@@ -22,8 +25,14 @@ import sqlalchemy.sql as sql
 from sqlalchemy.sql.elements import Over as _Over
 from sqlalchemy.ext.compiler import compiles as sa_compiles
 
-from ibis.client import SQLClient, AsyncQuery, Query
+import numpy as np
+import pandas as pd
+
+from ibis.client import SQLClient, AsyncQuery, Query, Database
 from ibis.sql.compiler import Select, Union, TableSetFormatter
+
+from ibis import compat
+
 import ibis.common as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
@@ -46,13 +55,13 @@ _ibis_type_to_sqla = {
 
     dt.Boolean: sa.Boolean,
 
-    dt.String: sa.String,
+    dt.String: sa.Text,
 
     dt.Date: sa.Date,
 
-    dt.Timestamp: sa.DateTime,
-
     dt.Decimal: sa.NUMERIC,
+    dt.Null: sa.types.NullType,
+    dt.Binary: sa.Binary,
 }
 
 _sqla_type_mapping = {
@@ -64,53 +73,94 @@ _sqla_type_mapping = {
     sa.BIGINT: dt.Int64,
     sa.Boolean: dt.Boolean,
     sa.BOOLEAN: dt.Boolean,
+    sa.Float: dt.Double,
     sa.FLOAT: dt.Double,
     sa.REAL: dt.Float,
+    sa.String: dt.String,
     sa.VARCHAR: dt.String,
-    sa.Float: dt.Double,
+    sa.CHAR: dt.String,
+    sa.Text: dt.String,
+    sa.TEXT: dt.String,
+    sa.BINARY: dt.Binary,
+    sa.Binary: dt.Binary,
     sa.DATE: dt.Date,
-
-    sa.types.TEXT: dt.String,
+    sa.Date: dt.Date,
     sa.types.NullType: dt.Null,
-    sa.types.Text: dt.String,
 }
 
-_sqla_type_to_ibis = dict((v, k) for k, v in
-                          _ibis_type_to_sqla.items())
+_sqla_type_to_ibis = dict((v, k) for k, v in _ibis_type_to_sqla.items())
 _sqla_type_to_ibis.update(_sqla_type_mapping)
 
 
-def schema_from_table(table):
-    # Convert SQLA table to Ibis schema
-    names = table.columns.keys()
+def sqlalchemy_type_to_ibis_type(
+    column_type, nullable=True, default_timezone=None
+):
+    type_class = type(column_type)
 
-    types = []
-    for c in table.columns.values():
-        type_class = type(c.type)
+    if isinstance(column_type, sa.types.NUMERIC):
+        return dt.Decimal(
+            column_type.precision, column_type.scale, nullable=nullable
+        )
+    else:
+        if type_class in _sqla_type_to_ibis:
+            ibis_class = _sqla_type_to_ibis[type_class]
+        elif isinstance(column_type, sa.DateTime):
+            return dt.Timestamp(
+                timezone=default_timezone if column_type.timezone else None,
+                nullable=nullable
+            )
+        elif isinstance(column_type, sa.ARRAY):
+            dimensions = column_type.dimensions
+            if dimensions is not None and dimensions != 1:
+                raise NotImplementedError(
+                    'Nested array types not yet supported'
+                )
+            value_type = sqlalchemy_type_to_ibis_type(
+                column_type.item_type,
+                default_timezone=default_timezone,
+            )
 
-        if isinstance(c.type, sa.types.NUMERIC):
-            t = dt.Decimal(c.type.precision,
-                           c.type.scale,
-                           nullable=c.nullable)
+            def make_array_type(nullable, value_type=value_type):
+                return dt.Array(value_type, nullable=nullable)
+
+            ibis_class = make_array_type
         else:
-            if c.type in _sqla_type_to_ibis:
-                ibis_class = _sqla_type_to_ibis[c.type]
-            elif type_class in _sqla_type_to_ibis:
-                ibis_class = _sqla_type_to_ibis[type_class]
-            elif isinstance(c.type, sa.DateTime):
-                ibis_class = dt.Timestamp()
-            else:
-                for k, v in _sqla_type_to_ibis.items():
-                    if isinstance(c.type, type(k)):
-                        ibis_class = v
-                        break
-                else:
-                    raise NotImplementedError(c.type)
-            t = ibis_class(c.nullable)
+            try:
+                ibis_class = next(
+                    v for k, v in _sqla_type_mapping.items()
+                    if isinstance(column_type, k)
+                )
+            except StopIteration:
+                raise NotImplementedError(
+                    'Unable to convert SQLAlchemy type {} to ibis type'.format(
+                        column_type
+                    )
+                )
+        return ibis_class(nullable)
 
-        types.append(t)
 
-    return dt.Schema(names, types)
+def schema_from_table(table):
+    """Retrieve an ibis schema from a SQLAlchemy ``Table``.
+
+    Parameters
+    ----------
+    table : sa.Table
+
+    Returns
+    -------
+    schema : ibis.expr.datatypes.Schema
+        An ibis schema corresponding to the types of the columns in `table`.
+    """
+    # Convert SQLA table to Ibis schema
+    types = [
+        sqlalchemy_type_to_ibis_type(
+            column.type,
+            nullable=column.nullable,
+            default_timezone='UTC',
+        )
+        for column in table.columns.values()
+    ]
+    return dt.Schema(table.columns.keys(), types)
 
 
 def table_from_schema(name, meta, schema):
@@ -126,11 +176,50 @@ def table_from_schema(name, meta, schema):
     return sa.Table(name, meta, *sqla_cols)
 
 
-def _to_sqla_type(itype):
+def _to_sqla_type(itype, type_map=None):
+    if type_map is None:
+        type_map = _ibis_type_to_sqla
     if isinstance(itype, dt.Decimal):
         return sa.types.NUMERIC(itype.precision, itype.scale)
+    elif isinstance(itype, dt.Timestamp):
+        # SQLAlchemy DateTimes do not store the timezone, just whether the db
+        # supports timezones.
+        return sa.TIMESTAMP(bool(itype.timezone))
+    elif isinstance(itype, dt.Array):
+        ibis_type = itype.value_type
+        if not isinstance(ibis_type, (dt.Primitive, dt.String)):
+            raise TypeError(
+                'Type {} is not a primitive type or string type'.format(
+                    ibis_type
+                )
+            )
+        return sa.ARRAY(_to_sqla_type(ibis_type, type_map=type_map))
     else:
-        return _ibis_type_to_sqla[type(itype)]
+        return type_map[type(itype)]
+
+
+def _variance_reduction(func_name):
+    suffix = {
+        'sample': 'samp',
+        'pop': 'pop'
+    }
+
+    def variance_compiler(t, expr):
+        arg, where, how = expr.op().args
+
+        if arg.type().equals(dt.boolean):
+            arg = arg.cast('int32')
+
+        func = getattr(
+            sa.func,
+            '{}_{}'.format(func_name, suffix.get(how, 'samp'))
+        )
+
+        if where is not None:
+            arg = where.ifelse(arg, None)
+        return func(t.translate(arg))
+
+    return variance_compiler
 
 
 def fixed_arity(sa_func, arity):
@@ -207,7 +296,9 @@ def _exists_subquery(t, expr):
                 .projection([ir.literal(1).name(ir.unnamed)]))
 
     sub_ctx = ctx.subcontext()
-    clause = to_sqlalchemy(filtered, context=sub_ctx, exists=True)
+    clause = to_sqlalchemy(
+        filtered, context=sub_ctx, exists=True, params=t.params
+    )
 
     if isinstance(op, transforms.NotExistsSubquery):
         clause = sa.not_(clause)
@@ -232,6 +323,10 @@ def _contains(t, expr):
 
     left, right = [t.translate(arg) for arg in op.args]
     return left.in_(right)
+
+
+def _not_contains(t, expr):
+    return sa.not_(_contains(t, expr))
 
 
 def _reduction(sa_func):
@@ -315,6 +410,12 @@ def _translate_case(t, cases, results, default):
     return sa.case(whens, else_=default)
 
 
+def _negate(t, expr):
+    op = expr.op()
+    arg, = map(t.translate, op.args)
+    return sa.not_(arg) if isinstance(expr, ir.BooleanValue) else -arg
+
+
 def unary(sa_func):
     return fixed_arity(sa_func, 1)
 
@@ -322,6 +423,7 @@ def unary(sa_func):
 _operation_registry = {
     ops.And: fixed_arity(sql.and_, 2),
     ops.Or: fixed_arity(sql.or_, 2),
+    ops.Not: unary(sa.not_),
 
     ops.Abs: unary(sa.func.abs),
 
@@ -332,6 +434,7 @@ _operation_registry = {
     ops.NullIf: fixed_arity(sa.func.nullif, 2),
 
     ops.Contains: _contains,
+    ops.NotContains: _not_contains,
 
     ops.Count: _reduction(sa.func.count),
     ops.Sum: _reduction(sa.func.sum),
@@ -347,7 +450,7 @@ _operation_registry = {
 
     ops.IsNull: _is_null,
     ops.NotNull: _not_null,
-    ops.Negate: unary(sa.not_),
+    ops.Negate: _negate,
 
     ops.Round: _round,
 
@@ -385,6 +488,7 @@ _binary_ops = {
     ops.LessEqual: operator.le,
     ops.Greater: operator.gt,
     ops.GreaterEqual: operator.ge,
+    ops.IdenticalTo: lambda x, y: x.op('IS NOT DISTINCT FROM')(y),
 
     # Boolean comparisons
 
@@ -410,17 +514,17 @@ class AlchemyContext(comp.QueryContext):
     def __init__(self, *args, **kwargs):
         self._table_objects = {}
         self.dialect = kwargs.pop('dialect', AlchemyDialect)
-        comp.QueryContext.__init__(self, *args, **kwargs)
+        super(AlchemyContext, self).__init__(*args, **kwargs)
 
     def subcontext(self):
         return type(self)(dialect=self.dialect, parent=self)
 
-    def _to_sql(self, expr, ctx):
-        return to_sqlalchemy(expr, context=ctx)
+    def _to_sql(self, expr, ctx, params=None):
+        return to_sqlalchemy(expr, context=ctx, params=params)
 
-    def _compile_subquery(self, expr):
+    def _compile_subquery(self, expr, params=None):
         sub_ctx = self.subcontext()
-        return self._to_sql(expr, sub_ctx)
+        return self._to_sql(expr, sub_ctx, params=params)
 
     def has_table(self, expr, parent_contexts=False):
         key = self._get_table_key(expr)
@@ -442,12 +546,11 @@ class AlchemyQueryBuilder(comp.QueryBuilder):
 
     select_builder = AlchemySelectBuilder
 
-    def __init__(self, expr, context=None, dialect=None):
-        if dialect is None:
-            dialect = AlchemyDialect
-
-        self.dialect = dialect
-        comp.QueryBuilder.__init__(self, expr, context=context)
+    def __init__(self, expr, context=None, dialect=None, params=None):
+        self.dialect = dialect if dialect is not None else AlchemyDialect
+        super(AlchemyQueryBuilder, self).__init__(
+            expr, context=context, params=params
+        )
 
     def _make_context(self):
         return AlchemyContext(dialect=self.dialect)
@@ -457,11 +560,11 @@ class AlchemyQueryBuilder(comp.QueryBuilder):
         return AlchemyUnion
 
 
-def to_sqlalchemy(expr, context=None, exists=False, dialect=None):
+def to_sqlalchemy(expr, context=None, exists=False, dialect=None, params=None):
     if context is not None:
         dialect = dialect or context.dialect
 
-    ast = build_ast(expr, context=context, dialect=dialect)
+    ast = build_ast(expr, context=context, dialect=dialect, params=params)
     query = ast.queries[0]
 
     if exists:
@@ -470,21 +573,92 @@ def to_sqlalchemy(expr, context=None, exists=False, dialect=None):
     return query.compile()
 
 
-def build_ast(expr, context=None, dialect=None):
-    builder = AlchemyQueryBuilder(expr, context=context, dialect=dialect)
+def build_ast(expr, context=None, dialect=None, params=None):
+    builder = AlchemyQueryBuilder(
+        expr, context=context, dialect=dialect, params=params
+    )
     return builder.get_result()
+
+
+class AlchemyDatabaseSchema(Database):
+
+    def __init__(self, name, database):
+        """
+
+        Parameters
+        ----------
+        name : str
+        database : AlchemyDatabase
+        """
+        self.name = name
+        self.database = database
+        self.client = database.client
+
+    def __repr__(self):
+        return "Schema({!r})".format(self.name)
+
+    def drop(self, force=False):
+        """
+        Drop the schema
+
+        Parameters
+        ----------
+        force : boolean, default False
+          Drop any objects if they exist, and do not fail if the schema does
+          not exist.
+        """
+        raise NotImplementedError(
+            "Drop is not implemented yet for sqlalchemy schemas")
+
+    def table(self, name):
+        """
+        Return a table expression referencing a table in this schema
+
+        Returns
+        -------
+        table : TableExpr
+        """
+        qualified_name = self._qualify(name)
+        return self.database.table(qualified_name, self.name)
+
+    def list_tables(self, like=None):
+        return self.database.list_tables(
+            schema=self.name,
+            like=self._qualify_like(like))
+
+
+class AlchemyDatabase(Database):
+    """
+
+    Attributes
+    ----------
+    client : AlchemyClient
+
+    """
+    schema_class = AlchemyDatabaseSchema
+
+    def table(self, name, schema=None):
+        return self.client.table(name, schema=schema)
+
+    def list_tables(self, like=None, schema=None):
+        return self.client.list_tables(
+            schema=schema,
+            like=self._qualify_like(like),
+            database=self.name)
+
+    def schema(self, name):
+        return self.schema_class(name, self)
 
 
 class AlchemyTable(ops.DatabaseTable):
 
-    def __init__(self, table, source):
+    def __init__(self, table, source, schema=None):
+        super(AlchemyTable, self).__init__(
+            table.name,
+            schema or schema_from_table(table),
+            source,
+        )
         self.sqla_table = table
-
-        schema = schema_from_table(table)
-        name = table.name
-
-        ops.TableNode.__init__(self, [name, schema, source])
-        ops.HasSchema.__init__(self, schema, name=name)
 
 
 class AlchemyExprTranslator(comp.ExprTranslator):
@@ -501,7 +675,7 @@ class AlchemyExprTranslator(comp.ExprTranslator):
         return AlchemyContext
 
     def get_sqla_type(self, data_type):
-        return self._type_map[type(data_type)]
+        return _to_sqla_type(data_type, type_map=self._type_map)
 
 
 rewrites = AlchemyExprTranslator.rewrites
@@ -511,13 +685,47 @@ compiles = AlchemyExprTranslator.compiles
 class AlchemyQuery(Query):
 
     def _fetch(self, cursor):
-        # No guarantees that the DBAPI cursor has data types
-        import pandas as pd
-        proxy = cursor.proxy
-        rows = proxy.fetchall()
-        colnames = proxy.keys()
-        return pd.DataFrame.from_records(rows, columns=colnames,
-                                         coerce_float=True)
+        df = pd.DataFrame.from_records(
+            cursor.proxy.fetchall(),
+            columns=cursor.proxy.keys(),
+            coerce_float=True
+        )
+        dtypes = df.dtypes
+        for column in df.columns:
+            existing_dtype = dtypes[column]
+            try:
+                db_type = _to_sqla_type(self.schema[column])
+            except KeyError:
+                new_dtype = existing_dtype
+            else:
+                try:
+                    new_dtype = self._db_type_to_dtype(db_type, column)
+                except TypeError:
+                    new_dtype = existing_dtype
+
+            if getattr(
+                existing_dtype, 'tz', None
+            ) != getattr(new_dtype, 'tz', None):
+                df[column] = df[column].astype(new_dtype)
+        return df
+
+    def _db_type_to_dtype(self, db_type, column):
+        if isinstance(db_type, sa.DateTime):
+            if not db_type.timezone:
+                return np.dtype('datetime64[ns]')
+            else:
+                return compat.DatetimeTZDtype(
+                    'ns', self.schema[column].timezone
+                )
+        raise TypeError(repr(db_type))
+
+    @property
+    def schema(self):
+        expr = self.expr
+        try:
+            return expr.schema()
+        except AttributeError:
+            return ibis.schema([(expr.get_name(), expr.type())])
 
 
 class AlchemyAsyncQuery(AsyncQuery):
@@ -529,21 +737,116 @@ class AlchemyDialect(object):
     translator = AlchemyExprTranslator
 
 
+def invalidates_reflection_cache(f):
+    """Invalidate the SQLAlchemy reflection cache if `f` performs an operation
+    that mutates database or table metadata such as ``CREATE TABLE``,
+    ``DROP TABLE``, etc.
+
+    Parameters
+    ----------
+    f : callable
+        A method on :class:`ibis.sql.alchemy.AlchemyClient`
+    """
+    @functools.wraps(f)
+    def wrapped(self, *args, **kwargs):
+        result = f(self, *args, **kwargs)
+
+        # only invalidate the cache after we've succesfully called the wrapped
+        # function
+        self._reflection_cache_is_dirty = True
+        return result
+    return wrapped
+
+
 class AlchemyClient(SQLClient):
 
     dialect = AlchemyDialect
     sync_query = AlchemyQuery
 
+    def __init__(self, con):
+        super(AlchemyClient, self).__init__()
+        self.con = con
+        self.meta = sa.MetaData(bind=con)
+        self._inspector = sa.inspect(con)
+        self._reflection_cache_is_dirty = False
+        self._schemas = {}
+
     @property
     def async_query(self):
-        raise NotImplementedError
+        raise NotImplementedError(
+            'async_query not implemented in {}'.format(type(self).__name__)
+        )
 
+    @property
+    def inspector(self):
+        if self._reflection_cache_is_dirty:
+            self._inspector.info_cache.clear()
+        return self._inspector
+
+    @contextlib.contextmanager
+    def begin(self):
+        with self.con.begin() as bind:
+            yield bind
+
+    @invalidates_reflection_cache
     def create_table(self, name, expr=None, schema=None, database=None):
-        pass
+        if database is not None and database != self.engine.url.database:
+            raise NotImplementedError(
+                'Creating tables from a different database is not yet '
+                'implemented'
+            )
 
-    def list_tables(self, like=None, database=None):
+        if expr is None and schema is None:
+            raise ValueError('You must pass either an expression or a schema')
+
+        if expr is not None and schema is not None:
+            if not expr.schema().equals(ibis.schema(schema)):
+                raise TypeError(
+                    'Expression schema is not equal to passed schema. '
+                    'Try passing the expression without the schema'
+                )
+        if schema is None:
+            schema = expr.schema()
+
+        self._schemas[self._fully_qualified_name(name, database)] = schema
+        t = table_from_schema(name, self.meta, schema)
+
+        with self.begin() as bind:
+            t.create(bind=bind)
+            if expr is not None:
+                bind.execute(
+                    t.insert().from_select(list(expr.columns), expr.compile())
+                )
+
+    @invalidates_reflection_cache
+    def drop_table(self, table_name, database=None, force=False):
+        if database is not None and database != self.engine.url.database:
+            raise NotImplementedError(
+                'Dropping tables from a different database is not yet '
+                'implemented'
+            )
+
+        t = sa.Table(table_name, self.meta)
+        t.drop(checkfirst=force)
+
+        assert not t.exists(), \
+            'Something went wrong during DROP of table {!r}'.format(t.name)
+
+        self.meta.remove(t)
+
+        qualified_name = self._fully_qualified_name(table_name, database)
+
+        try:
+            del self._schemas[qualified_name]
+        except KeyError:  # schemas won't be cached if created with raw_sql
+            pass
+
+    def truncate_table(self, table_name, database=None):
+        self.meta.tables[table_name].delete().execute()
+
+    def list_tables(self, like=None, database=None, schema=None):
         """
-        List tables in the current (or indicated) database.
+        List tables/views in the current (or indicated) database.
 
         Parameters
         ----------
@@ -556,21 +859,26 @@ class AlchemyClient(SQLClient):
         -------
         tables : list of strings
         """
-        if database is None:
-            database = self.current_database
-        names = self.con.table_names(schema=database)
+        inspector = self.inspector
+        names = inspector.get_table_names(schema=schema)
+        names.extend(inspector.get_view_names(schema=schema))
         if like is not None:
             names = [x for x in names if like in x]
-        return names
+        return sorted(names)
 
     def _execute(self, query, results=True):
-        return AlchemyProxy(self.con.execute(query))
+        with self.begin() as con:
+            return AlchemyProxy(con.execute(query))
 
-    def _build_ast(self, expr):
-        return build_ast(expr, dialect=self.dialect)
+    @invalidates_reflection_cache
+    def raw_sql(self, query, results=False):
+        return super(AlchemyClient, self).raw_sql(query, results=results)
 
-    def _get_sqla_table(self, name):
-        return sa.Table(name, self.meta, autoload=True)
+    def _build_ast(self, expr, params=None):
+        return build_ast(expr, dialect=self.dialect, params=params)
+
+    def _get_sqla_table(self, name, schema=None):
+        return sa.Table(name, self.meta, schema=schema, autoload=True)
 
     def _sqla_table_to_expr(self, table):
         node = AlchemyTable(table, self)
@@ -581,7 +889,7 @@ class AlchemySelect(Select):
 
     def __init__(self, *args, **kwargs):
         self.exists = kwargs.pop('exists', False)
-        Select.__init__(self, *args, **kwargs)
+        super(AlchemySelect, self).__init__(*args, **kwargs)
 
     def compile(self):
         # Can't tell if this is a hack or not. Revisit later
@@ -602,7 +910,7 @@ class AlchemySelect(Select):
         return frag
 
     def _compile_subqueries(self):
-        if len(self.subqueries) == 0:
+        if not self.subqueries:
             return
 
         for expr in self.subqueries:
@@ -769,6 +1077,14 @@ class _AlchemyTableSet(TableSetFormatter):
                 result = table.join(result, onclause, isouter=True)
             elif jtype is ops.OuterJoin:
                 result = result.outerjoin(table, onclause)
+            elif jtype is ops.LeftSemiJoin:
+                result = (sa.select([result])
+                          .where(sa.exists(sa.select([1])
+                                           .where(onclause))))
+            elif jtype is ops.LeftAntiJoin:
+                result = (sa.select([result])
+                          .where(~sa.exists(sa.select([1])
+                                            .where(onclause))))
             else:
                 raise NotImplementedError(jtype)
 
@@ -860,16 +1176,17 @@ class AlchemyUnion(Union):
 
     def compile(self):
         context = self.context
-
-        if self.distinct:
-            sa_func = sa.union
-        else:
-            sa_func = sa.union_all
+        sa_func = sa.union if self.distinct else sa.union_all
 
         left_set = context.get_compiled_expr(self.left)
-        right_set = context.get_compiled_expr(self.right)
+        left_cte = left_set.cte()
+        left_select = left_cte.select()
 
-        return sa_func(left_set, right_set)
+        right_set = context.get_compiled_expr(self.right)
+        right_cte = right_set.cte()
+        right_select = right_cte.select()
+
+        return sa_func(left_select, right_select)
 
 
 class AlchemyProxy(object):

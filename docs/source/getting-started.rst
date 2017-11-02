@@ -15,13 +15,13 @@ Installation
 System dependencies
 ~~~~~~~~~~~~~~~~~~~
 
-Ibis requires a working Python 2.6, 2.7, or 3.4 installation. We recommend
+Ibis requires a working Python 2.7 or >= 3.4 installation. We recommend
 `Anaconda <http://continuum.io/downloads>`_.
 
 Installing the Python package
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Install ibis using ``pip`` (or ``conda``, whenever it becomes available):
+Install ibis using ``pip`` or ``conda``:
 
 ::
 
@@ -39,20 +39,21 @@ Some platforms will require that you have Kerberos installed to build properly.
 
 * Redhat / CentOS: ``yum install krb5-devel``
 * Ubuntu / Debian: ``apt-get install libkrb5-dev``
+* Arch Linux     : ``pacman -S krb5``
 
-.. _install.sqlite:
+.. _install.impala:
 
-Ibis SQLite Quickstart
-----------------------
+`Impala <https://impala.apache.org/>`_ Quickstart
+-------------------------------------------------
 
-See http://blog.ibis-project.org/sqlite-crunchbase-quickstart/ for a quickstart
-using SQLite. Otherwise read on to try out Ibis on Impala.
+Install dependencies for Ibis's Impala dialect:
 
-Creating a client
------------------
+::
 
-To create an Ibis "client", you must first connect your services and assemble
-the client using ``ibis.impala.connect``:
+  pip install ibis-framework[impala]
+
+To create an Ibis client, you must first connect your services and assemble the
+client using :func:`~ibis.impala.connect`:
 
 .. code-block:: python
 
@@ -67,6 +68,86 @@ Both method calls can take ``auth_mechanism='GSSAPI'`` or
 cluster setup, this may also include SSL. See the :ref:`API reference
 <api.client>` for more, along with the Impala shell reference, as the
 connection semantics are identical.
+
+.. _install.sqlite:
+
+`SQLite <https://www.sqlite.org/>`_ Quickstart
+----------------------------------------------
+
+Install dependencies for Ibis's SQLite dialect:
+
+::
+
+  pip install ibis-framework[sqlite]
+
+Create a client by passing a path to a SQLite database to
+:func:`~ibis.sqlite.connect`:
+
+.. code-block:: python
+
+   >>> ibis.sqlite.connect('path/to/my/sqlite.db')
+
+See http://blog.ibis-project.org/sqlite-crunchbase-quickstart/ for a quickstart
+using SQLite.
+
+.. _install.postgres:
+
+`PostgreSQL <https://www.postgresql.org/>`_ Quickstart
+------------------------------------------------------
+
+Install dependencies for Ibis's PostgreSQL dialect:
+
+::
+
+  pip install ibis-framework[postgres]
+
+Create a client by passing a connection string or individual parameters to
+:func:`~ibis.postgres.connect`:
+
+.. code-block:: python
+
+   >>> con = ibis.postgres.connect(
+   ...     'postgresql://user:pass@host:port/my_database'
+   ... )
+   >>> con = ibis.postgres.connect(
+   ...     user='bob', port=23569, database='ibis_testing'
+   ... )
+
+.. _install.bigquery:
+
+`Clickhouse <https://clickhouse.yandex/>`_ Quickstart
+-----------------------------------------------------
+
+Install dependencies for Ibis's Clickhouse dialect:
+
+::
+
+  pip install ibis-framework[clickhouse]
+
+Create a client by passing in database connection parameters such as ``host``,
+``port``, ``database``, and ``user`` to :func:`~ibis.clickhouse.connect`:
+
+
+.. code-block:: python
+
+   >>> con = ibis.clickhouse.connect(host='localhost', port=9000)
+
+`BigQuery <https://cloud.google.com/bigquery/>`_ Quickstart
+-----------------------------------------------------------
+
+Install dependencies for Ibis's BigQuery dialect:
+
+::
+
+  pip install ibis-framework[bigquery]
+
+Create a client by passing in the project id and dataset id you wish to operate
+with:
+
+
+.. code-block:: python
+
+   >>> con = ibis.bigquery.connect(project_id='ibis-gbq', dataset_id='testing')
 
 Learning resources
 ------------------

@@ -17,18 +17,21 @@ import locale
 import string
 import platform
 import warnings
+import operator
 
-from functools import reduce, partial
-from operator import add
+from functools import reduce
 
 import sqlalchemy as sa
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import GenericFunction
 
-from ibis.sql.alchemy import unary, varargs, fixed_arity, Over
+from ibis.sql.alchemy import (
+    unary, varargs, fixed_arity, Over, _variance_reduction, _get_sqla_table
+)
+import ibis.expr.analytics as L
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-import ibis.expr.types as ir
+import ibis.expr.window as W
 
 import ibis.sql.alchemy as alch
 _operation_registry = alch._operation_registry.copy()
@@ -91,8 +94,17 @@ def _cast(t, expr):
     sa_type = t.get_sqla_type(typ)
 
     # specialize going from an integer type to a timestamp
-    if isinstance(arg.type(), dt.Integer) and issubclass(sa_type, sa.DateTime):
+    if isinstance(arg.type(), dt.Integer) and isinstance(sa_type, sa.DateTime):
         return sa.func.timezone('UTC', sa.func.to_timestamp(sa_arg))
+
+    if arg.type().equals(dt.binary) and typ.equals(dt.string):
+        return sa.func.encode(sa_arg, 'escape')
+
+    if typ.equals(dt.binary):
+        #  decode yields a column of memoryview which is annoying to deal with
+        # in pandas. CAST(expr AS BYTEA) is correct and returns byte strings.
+        return sa.cast(sa_arg, sa.Binary())
+
     return sa.cast(sa_arg, sa_type)
 
 
@@ -283,7 +295,8 @@ def _strftime(t, expr):
 
 
 def _distinct_from(a, b):
-    return ((a != None) | (b != None)) & sa.func.coalesce(a != b, True)
+    return (((a != None) | (b != None)) &  # noqa
+            sa.func.coalesce(a != b, True))
 
 
 def _find_in_set(t, expr):
@@ -316,26 +329,19 @@ def _regex_replace(t, expr):
     return sa.func.regexp_replace(string, pattern, replacement, 'g')
 
 
-def _variance_reduction(func_name):
-    suffix = {
-        'sample': 'samp',
-        'pop': 'pop'
-    }
+def _reduction(func_name):
+    def reduction_compiler(t, expr):
+        arg, where = expr.op().args
 
-    def variance_compiler(t, expr):
-        arg, where, how = expr.op().args
-        func = getattr(sa.func, '%s_%s' % (func_name, suffix.get(how, 'samp')))
+        if arg.type().equals(dt.boolean):
+            arg = arg.cast('int32')
 
-        if where is None:
-            return func(t.translate(arg))
-        else:
-            # TODO(wesm): PostgreSQL 9.4 stuff
-            # where_compiled = t.translate(where)
-            # return sa.funcfilter(result, where_compiled)
-            filtered = where.ifelse(ir.null(), arg)
-            return func(t.translate(filtered))
+        func = getattr(sa.func, func_name)
 
-    return variance_compiler
+        if where is not None:
+            arg = where.ifelse(arg, None)
+        return func(t.translate(arg))
+    return reduction_compiler
 
 
 def _log(t, expr):
@@ -358,7 +364,7 @@ _cumulative_to_reduction = {
 
 
 def _cumulative_to_window(translator, expr, window):
-    win = ibis.cumulative_window()
+    win = W.cumulative_window()
     win = win.group_by(window._group_by).order_by(window._order_by)
 
     op = expr.op()
@@ -386,13 +392,15 @@ def _window(t, expr):
         ops.Lead,
         ops.DenseRank,
         ops.MinRank,
+        ops.NTile,
+        ops.PercentRank,
         ops.FirstValue,
         ops.LastValue,
     )
 
     if isinstance(window_op, ops.CumulativeOp):
-        arg = _cumulative_to_window(translator, arg, window)
-        return translator.translate(arg)
+        arg = _cumulative_to_window(t, arg, window)
+        return t.translate(arg)
 
     # Some analytic functions need to have the expression of interest in
     # the ORDER BY part of the window clause
@@ -405,16 +413,25 @@ def _window(t, expr):
 
     result = Over(
         reduction,
-        partition_by=partition_by or None,
-        order_by=order_by or None,
+        partition_by=partition_by,
+        order_by=order_by,
         preceding=window.preceding,
         following=window.following,
     )
 
-    if isinstance(window_op, (ops.RowNumber, ops.DenseRank, ops.MinRank)):
+    if isinstance(
+        window_op, (ops.RowNumber, ops.DenseRank, ops.MinRank, ops.NTile)
+    ):
         return result - 1
     else:
         return result
+
+
+def _ntile(t, expr):
+    op = expr.op()
+    args = op.args
+    arg, buckets = map(t.translate, args)
+    return sa.func.ntile(buckets)
 
 
 class regex_extract(GenericFunction):
@@ -447,7 +464,147 @@ def _regex_extract(t, expr):
     )
 
 
+def _cardinality(array):
+    return sa.case(
+        [(array == None, None)],  # noqa: E711
+        else_=sa.func.coalesce(sa.func.array_length(array, 1), 0),
+    )
+
+
+def _array_repeat(t, expr):
+    """Is this really that useful?
+
+    Repeat an array like a Python list using modular arithmetic,
+    scalar subqueries, and PostgreSQL's ARRAY function.
+
+    This is inefficient if PostgreSQL allocates memory for the entire sequence
+    and the output column. A quick glance at PostgreSQL's C code shows the
+    sequence is evaluated stepwise, which suggests that it's roughly constant
+    memory for the sequence generation.
+    """
+    raw, times = map(t.translate, expr.op().args)
+
+    # SQLAlchemy uses our column's table in the FROM clause. We need a simpler
+    # expression to workaround this.
+    array = sa.column(raw.name, type_=raw.type)
+
+    # We still need to prefix the table name to the column name in the final
+    # query, so make sure the column knows its origin
+    array.table = raw.table
+
+    array_length = _cardinality(array)
+
+    # sequence from 1 to the total number of elements desired in steps of 1.
+    # the call to greatest isn't necessary, but it provides clearer intent
+    # rather than depending on the implicit postgres generate_series behavior
+    start = step = 1
+    stop = sa.func.greatest(times, 0) * array_length
+    series = sa.func.generate_series(start, stop, step).alias()
+    series_column = sa.column(series.name, type_=sa.INTEGER)
+
+    # if our current index modulo the array's length
+    # is a multiple of the array's length, then the index is the array's length
+    index_expression = series_column % array_length
+    index = sa.func.coalesce(sa.func.nullif(index_expression, 0), array_length)
+
+    # tie it all together in a scalar subquery and collapse that into an ARRAY
+    selected = sa.select([array[index]]).select_from(series)
+    return sa.func.array(selected.as_scalar())
+
+
+def _identical_to(t, expr):
+    left, right = args = expr.op().args
+    if left.equals(right):
+        return True
+    else:
+        left, right = map(t.translate, args)
+        return left.op('IS NOT DISTINCT FROM')(right)
+
+
+def _hll_cardinality(t, expr):
+    # postgres doesn't have a builtin HLL algorithm, so we default to standard
+    # count distinct for now
+    arg, _ = expr.op().args
+    sa_arg = t.translate(arg)
+    return sa.func.count(sa.distinct(sa_arg))
+
+
+def _table_column(t, expr):
+    op = expr.op()
+    ctx = t.context
+    table = op.table
+
+    sa_table = _get_sqla_table(ctx, table)
+    out_expr = getattr(sa_table.c, op.name)
+
+    expr_type = expr.type()
+
+    if isinstance(expr_type, dt.Timestamp):
+        timezone = expr_type.timezone
+        if timezone is not None:
+            out_expr = out_expr.op('AT TIME ZONE')(timezone).label(op.name)
+
+    # If the column does not originate from the table set in the current SELECT
+    # context, we should format as a subquery
+    if t.permit_subquery and ctx.is_foreign_expr(table):
+        return sa.select([out_expr])
+
+    return out_expr
+
+
+def _round(t, expr):
+    arg, digits = expr.op().args
+    sa_arg = t.translate(arg)
+
+    if digits is None:
+        return sa.func.round(sa_arg)
+
+    # postgres doesn't allow rounding of double precision values to a specific
+    # number of digits (though simple truncation on doubles is allowed) so
+    # we cast to numeric and then cast back if necessary
+    result = sa.func.round(sa.cast(sa_arg, sa.NUMERIC), t.translate(digits))
+    if digits is not None and isinstance(arg.type(), dt.Decimal):
+        return result
+    return sa.cast(result, sa.dialects.postgresql.DOUBLE_PRECISION())
+
+
+def _mod(t, expr):
+    left, right = map(t.translate, expr.op().args)
+
+    # postgres doesn't allow modulus of double precision values, so upcast and
+    # then downcast later if necessary
+    if not isinstance(expr.type(), dt.Integer):
+        left = sa.cast(left, sa.NUMERIC)
+        right = sa.cast(right, sa.NUMERIC)
+
+    result = left % right
+    if expr.type().equals(dt.double):
+        return sa.cast(result, sa.dialects.postgresql.DOUBLE_PRECISION())
+    else:
+        return result
+
+
+def _floor_divide(t, expr):
+    left, right = map(t.translate, expr.op().args)
+    return sa.func.floor(left / right)
+
+
+def _array_slice(t, expr):
+    arg, start, stop = expr.op().args
+    sa_arg = t.translate(arg)
+    sa_start = t.translate(start)
+
+    if stop is None:
+        sa_stop = _cardinality(sa_arg)
+    else:
+        sa_stop = t.translate(stop)
+    return sa_arg[sa_start + 1:sa_stop]
+
+
 _operation_registry.update({
+    # We override this here to support time zones
+    ops.TableColumn: _table_column,
+
     # types
     ops.Cast: _cast,
     ops.TypeOf: _typeof,
@@ -493,6 +650,7 @@ _operation_registry.update({
 
     ops.Ceil: fixed_arity(sa.func.ceil, 1),
     ops.Floor: fixed_arity(sa.func.floor, 1),
+    ops.FloorDivide: _floor_divide,
     ops.Exp: fixed_arity(sa.func.exp, 1),
     ops.Sign: fixed_arity(sa.func.sign, 1),
     ops.Sqrt: fixed_arity(sa.func.sqrt, 1),
@@ -500,6 +658,9 @@ _operation_registry.update({
     ops.Ln: fixed_arity(sa.func.ln, 1),
     ops.Log2: fixed_arity(lambda x: sa.func.log(2, x), 1),
     ops.Log10: fixed_arity(sa.func.log, 1),
+    ops.Power: fixed_arity(sa.func.power, 2),
+    ops.Round: _round,
+    ops.Modulus: _mod,
 
     # dates and times
     ops.Strftime: _strftime,
@@ -510,6 +671,10 @@ _operation_registry.update({
     ops.ExtractMinute: _extract('minute'),
     ops.ExtractSecond: _second,
     ops.ExtractMillisecond: _millisecond,
+    ops.Sum: _reduction('sum'),
+    ops.Mean: _reduction('avg'),
+    ops.Min: _reduction('min'),
+    ops.Max: _reduction('max'),
     ops.Variance: _variance_reduction('var'),
     ops.StandardDev: _variance_reduction('stddev'),
 
@@ -518,6 +683,20 @@ _operation_registry.update({
     ops.WindowOp: _window,
     ops.CumulativeOp: _window,
     ops.RowNumber: fixed_arity(lambda: sa.func.row_number(), 0),
+    ops.DenseRank: fixed_arity(lambda arg: sa.func.dense_rank(), 1),
+    ops.MinRank: fixed_arity(lambda arg: sa.func.rank(), 1),
+    ops.PercentRank: fixed_arity(lambda arg: sa.func.percent_rank(), 1),
+    ops.NTile: _ntile,
+
+    # array operations
+    ops.ArrayLength: fixed_arity(_cardinality, 1),
+    ops.ArrayCollect: fixed_arity(sa.func.array_agg, 1),
+    ops.ArraySlice: _array_slice,
+    ops.ArrayIndex: fixed_arity(lambda array, index: array[index + 1], 2),
+    ops.ArrayConcat: fixed_arity(operator.add, 2),
+    ops.ArrayRepeat: _array_repeat,
+    ops.IdenticalTo: _identical_to,
+    ops.HLLCardinality: _hll_cardinality,
 })
 
 

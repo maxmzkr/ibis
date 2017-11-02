@@ -29,7 +29,7 @@ natively within other systems like Apache Spark and Apache Impala (incubating).
 To learn more about Ibis's vision, roadmap, and updates, please follow
 http://ibis-project.org.
 
-Source code is on GitHub: http://github.com/cloudera/ibis
+Source code is on GitHub: http://github.com/pandas-dev/ibis
 
 Install Ibis from PyPI with:
 
@@ -48,8 +48,10 @@ At this time, Ibis offers some level of support for the following systems:
 - `Apache Impala (incubating) <http://impala.io/>`_
 - `Apache Kudu (incubating) <http://getkudu.io>`_
 - Hadoop Distributed File System (HDFS)
-- PostgreSQL (Experimental)
+- PostgreSQL
 - SQLite
+- Google BigQuery (experimental)
+- Direct execution of ibis expressions against pandas objects (Experimental)
 
 Coming from SQL? Check out :ref:`Ibis for SQL Programmers <sql>`.
 
@@ -83,9 +85,9 @@ places, but this will improve as things progress.
    impala
    api
    sql
-   release
    developer
    type-system
+   release
    legal
 
 Indices and tables

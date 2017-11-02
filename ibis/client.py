@@ -12,17 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pandas as pd
+
 from ibis.compat import zip as czip
 from ibis.config import options
+
+import ibis.common as com
 import ibis.expr.types as ir
 import ibis.expr.operations as ops
 import ibis.sql.compiler as comp
-import ibis.common as com
 import ibis.util as util
 
 
 class Client(object):
-
     pass
 
 
@@ -36,6 +38,9 @@ class Query(object):
 
     def __init__(self, client, ddl):
         self.client = client
+        self.expr = getattr(
+            ddl, 'parent_expr', getattr(ddl, 'table_set', None)
+        )
 
         if isinstance(ddl, comp.DDL):
             self.compiled_ddl = ddl.compile()
@@ -57,7 +62,6 @@ class Query(object):
         return result
 
     def _fetch(self, cursor):
-        import pandas as pd
         rows = cursor.fetchall()
         # TODO(wesm): please evaluate/reimpl to optimize for perf/memory
         dtypes = [self._db_type_to_dtype(x[1]) for x in cursor.description]
@@ -71,15 +75,13 @@ class Query(object):
                 cols[name] = pd.Series(col)
         return pd.DataFrame(cols, columns=names)
 
-    def _db_type_to_dtype(self, db_type):
+    def _db_type_to_dtype(self, db_type, column):
         raise NotImplementedError
 
 
 class AsyncQuery(Query):
 
-    """
-    Abstract asynchronous query
-    """
+    """Abstract asynchronous query"""
 
     def execute(self):
         raise NotImplementedError
@@ -170,12 +172,7 @@ class SQLClient(Client):
         """
         # Get the schema by adding a LIMIT 0 on to the end of the query. If
         # there is already a limit in the query, we find and remove it
-        limited_query = """\
-SELECT *
-FROM (
-{0}
-) t0
-LIMIT 0""".format(query)
+        limited_query = 'SELECT * FROM ({}) t0 LIMIT 0'.format(query)
         schema = self._get_schema_using_query(limited_query)
 
         node = ops.SQLQueryResult(query, schema, self)
@@ -222,7 +219,7 @@ LIMIT 0""".format(query)
           Array expressions: pandas.Series
           Scalar expressions: Python scalar value
         """
-        ast = self._build_ast_ensure_limit(expr, limit)
+        ast = self._build_ast_ensure_limit(expr, limit, params=params)
 
         if len(ast.queries) > 1:
             raise NotImplementedError
@@ -241,12 +238,12 @@ LIMIT 0""".format(query)
         -------
         output : single query or list of queries
         """
-        ast = self._build_ast_ensure_limit(expr, limit)
+        ast = self._build_ast_ensure_limit(expr, limit, params=params)
         queries = [query.compile() for query in ast.queries]
         return queries[0] if len(queries) == 1 else queries
 
-    def _build_ast_ensure_limit(self, expr, limit):
-        ast = self._build_ast(expr)
+    def _build_ast_ensure_limit(self, expr, limit, params=None):
+        ast = self._build_ast(expr, params=params)
         # note: limit can still be None at this point, if the global
         # default_limit is None
         for query in reversed(ast.queries):
@@ -294,7 +291,7 @@ LIMIT 0""".format(query)
         return 'Query:\n{0}\n\n{1}'.format(util.indent(query, 2),
                                            '\n'.join(result))
 
-    def _build_ast(self, expr):
+    def _build_ast(self, expr, params=None):
         # Implement in clients
         raise NotImplementedError
 
@@ -309,40 +306,49 @@ class QueryPipeline(object):
     pass
 
 
-def execute(expr, limit='default', async=False):
-    backend = find_backend(expr)
-    return backend.execute(expr, limit=limit, async=async)
-
-
-def compile(expr, limit=None):
-    backend = find_backend(expr)
-    return backend.compile(expr, limit=limit)
-
-
-def find_backend(expr):
-    backends = []
-
-    def walk(expr):
-        node = expr.op()
-        for arg in node.flat_args():
-            if isinstance(arg, Client):
-                backends.append(arg)
-            elif isinstance(arg, ir.Expr):
-                walk(arg)
-
-    walk(expr)
-    backends = util.unique_by_key(backends, id)
+def validate_backends(backends):
+    if not backends:
+        default = options.default_backend
+        if default is None:
+            raise com.IbisError(
+                'Expression depends on no backends, and found no default'
+            )
+        return [default]
 
     if len(backends) > 1:
         raise ValueError('Multiple backends found')
-    elif len(backends) == 0:
-        default = options.default_backend
-        if default is None:
-            raise com.IbisError('Expression depends on no backends, '
-                                'and found no default')
-        return default
+    return backends
 
-    return backends[0]
+
+def execute(expr, limit='default', async=False, params=None):
+    backend, = validate_backends(list(find_backends(expr)))
+    return backend.execute(expr, limit=limit, async=async, params=params)
+
+
+def compile(expr, limit=None, params=None):
+    backend, = validate_backends(list(find_backends(expr)))
+    return backend.compile(expr, limit=limit, params=params)
+
+
+def find_backends(expr):
+    seen_backends = set()
+
+    stack = [expr.op()]
+    seen = set()
+
+    while stack:
+        node = stack.pop()
+
+        if node not in seen:
+            seen.add(node)
+
+            for arg in node.flat_args():
+                if isinstance(arg, Client):
+                    if arg not in seen_backends:
+                        yield arg
+                        seen_backends.add(arg)
+                elif isinstance(arg, ir.Expr):
+                    stack.append(arg.op())
 
 
 class Database(object):
@@ -352,12 +358,12 @@ class Database(object):
         self.client = client
 
     def __repr__(self):
-        return "{0}('{1}')".format('Database', self.name)
+        return '{}({!r})'.format(type(self).__name__, self.name)
 
     def __dir__(self):
         attrs = dir(type(self))
         unqualified_tables = [self._unqualify(x) for x in self.tables]
-        return list(sorted(set(attrs + unqualified_tables)))
+        return sorted(frozenset(attrs + unqualified_tables))
 
     def __contains__(self, key):
         return key in self.tables
@@ -370,15 +376,7 @@ class Database(object):
         return self.table(key)
 
     def __getattr__(self, key):
-        special_attrs = ['_ipython_display_', 'trait_names',
-                         '_getAttributeNames']
-
-        try:
-            return object.__getattribute__(self, key)
-        except AttributeError:
-            if key in special_attrs:
-                raise
-            return self.table(key)
+        return self.table(key)
 
     def _qualify(self, value):
         return value
@@ -437,8 +435,9 @@ class DatabaseNamespace(Database):
         self.namespace = namespace
 
     def __repr__(self):
-        return ("{0}(database={1!r}, namespace={2!r})"
-                .format('DatabaseNamespace', self.name, self.namespace))
+        return "{}(database={!r}, namespace={!r})".format(
+            type(self).__name__, self.name, self.namespace
+        )
 
     @property
     def client(self):

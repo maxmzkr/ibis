@@ -12,34 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import print_function
+
+import warnings
+import operator
+import functools
+import collections
+
 import six
+import toolz
 
 from ibis.expr.datatypes import Schema  # noqa
+from ibis.expr import datatypes as dt
 from ibis.expr.types import (Expr,  # noqa
-                             ValueExpr, ScalarExpr, ArrayExpr,
+                             ValueExpr, ScalarExpr, ColumnExpr,
                              TableExpr,
-                             NumericValue, NumericArray,
+                             NumericValue, NumericColumn,
                              IntegerValue,
-                             Int8Value, Int8Scalar, Int8Array,
-                             Int16Value, Int16Scalar, Int16Array,
-                             Int32Value, Int32Scalar, Int32Array,
-                             Int64Value, Int64Scalar, Int64Array,
+                             Int8Value, Int8Scalar, Int8Column,
+                             Int16Value, Int16Scalar, Int16Column,
+                             Int32Value, Int32Scalar, Int32Column,
+                             Int64Value, Int64Scalar, Int64Column,
                              NullScalar,
-                             BooleanValue, BooleanScalar, BooleanArray,
-                             FloatValue, FloatScalar, FloatArray,
-                             DoubleValue, DoubleScalar, DoubleArray,
-                             StringValue, StringScalar, StringArray,
-                             DecimalValue, DecimalScalar, DecimalArray,
-                             TimestampValue, TimestampScalar, TimestampArray,
+                             BooleanValue, BooleanScalar, BooleanColumn,
+                             FloatValue, FloatScalar, FloatColumn,
+                             DoubleValue, DoubleScalar, DoubleColumn,
+                             StringValue, StringScalar, StringColumn,
+                             DecimalValue, DecimalScalar, DecimalColumn,
+                             TimestampValue, TimestampScalar, TimestampColumn,
+                             DateValue, TimeValue,
+                             ArrayValue, ArrayScalar, ArrayColumn,
+                             MapValue, MapScalar, MapColumn,
+                             StructValue, StructScalar, StructColumn,
                              CategoryValue, unnamed, as_value_expr, literal,
-                             null, sequence)
+                             param, null, sequence)
 
 # __all__ is defined
 from ibis.expr.temporal import *  # noqa
 
 import ibis.common as _com
-
-from ibis.compat import py_string
+from ibis.compat import PY2, to_time
 from ibis.expr.analytics import bucket, histogram
 from ibis.expr.groupby import GroupedTableExpr  # noqa
 from ibis.expr.window import window, trailing_window, cumulative_window
@@ -52,7 +64,8 @@ import ibis.util as util
 
 
 __all__ = [
-    'schema', 'table', 'literal', 'expr_list', 'timestamp',
+    'schema', 'table', 'literal', 'expr_list',
+    'timestamp', 'time', 'param',
     'case', 'where', 'sequence',
     'now', 'desc', 'null', 'NA',
     'cast', 'coalesce', 'greatest', 'least',
@@ -61,7 +74,7 @@ __all__ = [
     'row_number',
     'negate', 'ifelse',
     'Expr', 'Schema',
-    'window', 'trailing_window', 'cumulative_window'
+    'window', 'trailing_window', 'cumulative_window',
 ]
 __all__ += _T.__all__
 
@@ -133,9 +146,9 @@ def desc(expr):
 
     Examples
     --------
-    result = (self.table.group_by('g')
-              .size('count')
-              .sort_by(ibis.desc('count')))
+    >>> import ibis
+    >>> t = ibis.table([('g', 'string')])
+    >>> result = t.group_by('g').size('count').sort_by(ibis.desc('count'))
     """
     if not isinstance(expr, Expr):
         return _ops.DeferredSortKey(expr, ascending=False)
@@ -146,12 +159,45 @@ def desc(expr):
 def timestamp(value):
     """
     Returns a timestamp literal if value is likely coercible to a timestamp
+
+    Parameters
+    ----------
+    value : timestamp value as string
+
+    Returns
+    --------
+    result : TimestampScalar
     """
-    if isinstance(value, py_string):
+    if isinstance(value, six.string_types):
         from pandas import Timestamp
         value = Timestamp(value)
-    op = ir.Literal(value)
-    return ir.TimestampScalar(op)
+    if isinstance(value, six.integer_types):
+        warnings.warn(
+            'Integer values for timestamp literals are deprecated in 0.11.0 '
+            'and will be removed in 0.12.0. To pass integers as timestamp '
+            'literals, use pd.Timestamp({:d}, unit=...)'.format(value)
+        )
+    return ir.TimestampScalar(ir.literal(value).op())
+
+
+def time(value):
+    """
+    Returns a time literal if value is likely coercible to a time
+
+    Parameters
+    ----------
+    value : time value as string
+
+    Returns
+    --------
+    result : TimeScalar
+    """
+    if PY2:
+        raise ValueError("time support is not enabled on python 2")
+
+    if isinstance(value, six.string_types):
+        value = to_time(value)
+    return ir.TimeScalar(ir.literal(value).op())
 
 
 schema.__doc__ = """\
@@ -170,12 +216,12 @@ types : list of string
 
 Examples
 --------
-sc = schema([('foo', 'string'),
-             ('bar', 'int64'),
-             ('baz', 'boolean')])
-
-sc2 = schema(names=['foo', 'bar', 'baz'],
-             types=['string', 'int64', 'boolean'])
+>>> from ibis import schema
+>>> sc = schema([('foo', 'string'),
+...              ('bar', 'int64'),
+...              ('baz', 'boolean')])
+>>> sc2 = schema(names=['foo', 'bar', 'baz'],
+...              types=['string', 'int64', 'boolean'])
 
 Returns
 -------
@@ -194,9 +240,14 @@ def case():
 
     Examples
     --------
-    expr = (ibis.case()
-            .when(cond1, result1)
-            .when(cond2, result2).end())
+    >>> import ibis
+    >>> cond1 = ibis.literal(1) == 1
+    >>> cond2 = ibis.literal(2) == 1
+    >>> result1 = 3
+    >>> result2 = 4
+    >>> expr = (ibis.case()
+    ...         .when(cond1, result1)
+    ...         .when(cond2, result2).end())
 
     Returns
     -------
@@ -278,7 +329,7 @@ def count(expr, where=None):
     counts : int64 type
     """
     op = expr.op()
-    if isinstance(op, _ops.DistinctArray):
+    if isinstance(op, _ops.DistinctColumn):
         if where is not None:
             raise NotImplementedError
         result = op.count().to_expr()
@@ -311,7 +362,7 @@ def _binop_expr(name, klass):
             other = as_value_expr(other)
             op = klass(self, other)
             return op.to_expr()
-        except _com.InputTypeError:
+        except NotImplementedError:
             return NotImplemented
 
     f.__name__ = name
@@ -342,6 +393,13 @@ def _boolean_binary_op(name, klass):
 
     f.__name__ = name
 
+    return f
+
+
+def _boolean_unary_op(name, klass):
+    def f(self):
+        return klass(self).to_expr()
+    f.__name__ = name
     return f
 
 
@@ -384,22 +442,18 @@ def _extract_field(name, klass):
 def cast(arg, target_type):
     # validate
     op = _ops.Cast(arg, target_type)
+    to = op.args[1]
 
-    if op.args[1] == arg.type():
+    if to.equals(arg.type()):
         # noop case if passed type is the same
         return arg
     else:
         result = op.to_expr()
         if not arg.has_name():
             return result
-        try:
-            expr_name = ('cast({0}, {1!s})'
-                         .format(arg.get_name(),
-                                 op.args[1]))
-            result = result.name(expr_name)
-        except:
-            pass
-        return result
+        expr_name = 'cast({}, {})'.format(arg.get_name(), op.args[1])
+        return result.name(expr_name)
+
 
 cast.__doc__ = """
 Cast value(s) to indicated data type. Values that cannot be
@@ -457,8 +511,10 @@ def fillna(arg, fill_value):
 
     Examples
     --------
-    result = table.col.fillna(5)
-    result2 = table.col.fillna(table.other_col * 3)
+    >>> import ibis
+    >>> table = ibis.table([('col', 'int64'), ('other_col', 'int64')])
+    >>> result = table.col.fillna(5)
+    >>> result2 = table.col.fillna(table.other_col * 3)
 
     Returns
     -------
@@ -478,7 +534,10 @@ def coalesce(*args):
 
     Examples
     --------
-    result = coalesce(expr1, expr2, 5)
+    >>> import ibis
+    >>> expr1 = None
+    >>> expr2 = 4
+    >>> result = ibis.coalesce(expr1, expr2, 5)
 
     Returns
     -------
@@ -556,9 +615,11 @@ def over(expr, window):
     result = op.to_expr()
 
     try:
-        result = result.name(expr.get_name())
-    except:
+        name = expr.get_name()
+    except _com.ExpressionError:
         pass
+    else:
+        result = result.name(name)
 
     return result
 
@@ -618,6 +679,7 @@ def between(arg, lower, upper):
     """
     lower = _ops.as_value_expr(lower)
     upper = _ops.as_value_expr(upper)
+
     op = _ops.Between(arg, lower, upper)
     return op.to_expr()
 
@@ -635,9 +697,11 @@ def isin(arg, values):
 
     Examples
     --------
-    expr = table.strings.isin(['foo', 'bar', 'baz'])
-
-    expr2 = table.strings.isin(table2.other_string_col)
+    >>> import ibis
+    >>> table = ibis.table([('string_col', 'string')])
+    >>> table2 = ibis.table([('other_string_col', 'string')])
+    >>> expr = table.string_col.isin(['foo', 'bar', 'baz'])
+    >>> expr2 = table.string_col.isin(table2.other_string_col)
 
     Returns
     -------
@@ -709,11 +773,11 @@ def _case(arg):
 
     Examples
     --------
-    case_expr = (expr.case()
-                 .when(case1, output1)
-                 .when(case2, output2)
-                 .default(default_output)
-                 .end())
+    >>> case_expr = (expr.case()
+    ...              .when(case1, output1)
+    ...              .when(case2, output2)
+    ...              .default(default_output)
+    ...              .end())  # doctest: +SKIP
 
     Returns
     -------
@@ -757,47 +821,14 @@ _generic_value_methods = dict(
     cases=cases,
     substitute=substitute,
 
-    __add__=add,
-    add=add,
-
-    __sub__=sub,
-    sub=sub,
-
-    __mul__=mul,
-    mul=mul,
-
-    __div__=div,
-    __truediv__=div,
-    __floordiv__=floordiv,
-    div=div,
-    floordiv=floordiv,
-
-    __rdiv__=rdiv,
-    __rtruediv__=rdiv,
-    __rfloordiv__=rfloordiv,
-    rdiv=rdiv,
-    rfloordiv=rfloordiv,
-
-    __pow__=pow,
-    pow=pow,
-
-    __radd__=add,
-
-    __rsub__=rsub,
-    rsub=rsub,
-
-    __rmul__=_rbinop_expr('__rmul__', _ops.Multiply),
-    __rpow__=_binop_expr('__rpow__', _ops.Power),
-
-    __mod__=mod,
-    __rmod__=_rbinop_expr('__rmod__', _ops.Modulus),
-
     __eq__=_binop_expr('__eq__', _ops.Equals),
     __ne__=_binop_expr('__ne__', _ops.NotEquals),
     __ge__=_binop_expr('__ge__', _ops.GreaterEqual),
     __gt__=_binop_expr('__gt__', _ops.Greater),
     __le__=_binop_expr('__le__', _ops.LessEqual),
-    __lt__=_binop_expr('__lt__', _ops.Less)
+    __lt__=_binop_expr('__lt__', _ops.Less),
+    collect=_unary_op('collect', _ops.ArrayCollect),
+    identical_to=_binop_expr('identical_to', _ops.IdenticalTo),
 )
 
 
@@ -819,8 +850,13 @@ first = _unary_op('first', _ops.FirstValue)
 last = _unary_op('last', _ops.LastValue)
 rank = _unary_op('rank', _ops.MinRank)
 dense_rank = _unary_op('dense_rank', _ops.DenseRank)
+percent_rank = _unary_op('percent_rank', _ops.PercentRank)
 cummin = _unary_op('cummin', _ops.CumulativeMin)
 cummax = _unary_op('cummax', _ops.CumulativeMax)
+
+
+def ntile(arg, buckets):
+    return _ops.NTile(arg, buckets).to_expr()
 
 
 def nth(arg, k):
@@ -846,7 +882,7 @@ def distinct(arg):
     in conjunction with other array expressions from the same context
     (because it's a cardinality-modifying pseudo-reduction).
     """
-    op = _ops.DistinctArray(arg)
+    op = _ops.DistinctColumn(arg)
     return op.to_expr()
 
 
@@ -950,7 +986,7 @@ def expr_list(exprs):
     return ir.ExpressionList(exprs).to_expr()
 
 
-_generic_array_methods = dict(
+_generic_column_methods = dict(
     bottomk=bottomk,
     distinct=distinct,
     nunique=nunique,
@@ -968,7 +1004,9 @@ _generic_array_methods = dict(
     last=last,
     dense_rank=dense_rank,
     rank=rank,
+    percent_rank=percent_rank,
     # nth=nth,
+    ntile=ntile,
     lag=lag,
     lead=lead,
     cummin=cummin,
@@ -977,7 +1015,7 @@ _generic_array_methods = dict(
 
 
 _add_methods(ValueExpr, _generic_value_methods)
-_add_methods(ArrayExpr, _generic_array_methods)
+_add_methods(ColumnExpr, _generic_column_methods)
 
 
 # ---------------------------------------------------------------------
@@ -1015,6 +1053,60 @@ def log(arg, base=None):
     logarithm : double type
     """
     op = _ops.Log(arg, base)
+    return op.to_expr()
+
+
+def clip(arg, lower=None, upper=None):
+    """
+    Trim values at input threshold(s).
+
+    Parameters
+    ----------
+    lower : float
+    upper : float
+
+    Returns
+    -------
+    clipped : same as type of the input
+    """
+    if lower is None and upper is None:
+        raise ValueError("at least one of lower and "
+                         "upper must be provided")
+
+    op = _ops.Clip(arg, lower, upper)
+    return op.to_expr()
+
+
+def quantile(arg, quantile, interpolation='linear'):
+    """
+    Return value at the given quantile, a la numpy.percentile.
+
+    Parameters
+    ----------
+    quantile : float/int or array-like
+        0 <= quantile <= 1, the quantile(s) to compute
+    interpolation : {'linear', 'lower', 'higher', 'midpoint', 'nearest'}
+
+        This optional parameter specifies the interpolation method to use,
+        when the desired quantile lies between two data points `i` and `j`:
+
+        * linear: `i + (j - i) * fraction`, where `fraction` is the
+          fractional part of the index surrounded by `i` and `j`.
+        * lower: `i`.
+        * higher: `j`.
+        * nearest: `i` or `j` whichever is nearest.
+        * midpoint: (`i` + `j`) / 2.
+
+    Returns
+    -------
+    quantile
+        if scalar input, scalar type, same as input
+        if array input, list of scalar type
+    """
+    if isinstance(quantile, collections.Sequence):
+        op = _ops.MultiQuantile(arg, quantile, interpolation)
+    else:
+        op = _ops.Quantile(arg, quantile, interpolation)
     return op.to_expr()
 
 
@@ -1061,6 +1153,42 @@ _numeric_value_methods = dict(
     round=round,
     nullifzero=_unary_op('nullifzero', _ops.NullIfZero),
     zeroifnull=_unary_op('zeroifnull', _ops.ZeroIfNull),
+    clip=clip,
+
+    __add__=add,
+    add=add,
+
+    __sub__=sub,
+    sub=sub,
+
+    __mul__=mul,
+    mul=mul,
+
+    __div__=div,
+    __truediv__=div,
+    __floordiv__=floordiv,
+    div=div,
+    floordiv=floordiv,
+
+    __rdiv__=rdiv,
+    __rtruediv__=rdiv,
+    __rfloordiv__=rfloordiv,
+    rdiv=rdiv,
+    rfloordiv=rfloordiv,
+
+    __pow__=pow,
+    pow=pow,
+
+    __radd__=add,
+
+    __rsub__=rsub,
+    rsub=rsub,
+
+    __rmul__=_rbinop_expr('__rmul__', _ops.Multiply),
+    __rpow__=_binop_expr('__rpow__', _ops.Power),
+
+    __mod__=mod,
+    __rmod__=_rbinop_expr('__rmod__', _ops.Modulus),
 )
 
 
@@ -1128,12 +1256,14 @@ def variance(arg, where=None, how='sample'):
     return expr
 
 
-_numeric_array_methods = dict(
+_numeric_column_methods = dict(
     mean=mean,
     cummean=cummean,
 
     sum=sum,
     cumsum=cumsum,
+
+    quantile=quantile,
 
     std=std,
     var=variance,
@@ -1146,7 +1276,7 @@ _numeric_array_methods = dict(
 _add_methods(NumericValue, _numeric_value_methods)
 _add_methods(IntegerValue, _integer_value_methods)
 
-_add_methods(NumericArray, _numeric_array_methods)
+_add_methods(NumericColumn, _numeric_column_methods)
 
 
 # ----------------------------------------------------------------------
@@ -1177,11 +1307,12 @@ _boolean_value_methods = dict(
     __xor__=_boolean_binary_op('__xor__', _ops.Xor),
     __rand__=_boolean_binary_rop('__rand__', _ops.And),
     __ror__=_boolean_binary_rop('__ror__', _ops.Or),
-    __rxor__=_boolean_binary_rop('__rxor__', _ops.Xor)
+    __rxor__=_boolean_binary_rop('__rxor__', _ops.Xor),
+    __invert__=_boolean_unary_op('__invert__', _ops.Not),
 )
 
 
-_boolean_array_methods = dict(
+_boolean_column_methods = dict(
     any=_unary_op('any', _ops.Any),
     notany=_unary_op('notany', _ops.NotAny),
     all=_unary_op('all', _ops.All),
@@ -1192,7 +1323,7 @@ _boolean_array_methods = dict(
 
 
 _add_methods(BooleanValue, _boolean_value_methods)
-_add_methods(BooleanArray, _boolean_array_methods)
+_add_methods(BooleanColumn, _boolean_column_methods)
 
 
 # ---------------------------------------------------------------------
@@ -1273,8 +1404,11 @@ def _translate(self, from_str, to_str):
 
     Examples
     --------
-    expr = table.strings.translate('a', 'b')
-    expr = table.string.translate('a', 'bc')
+    >>> import ibis
+    >>> table = ibis.table([('string_col', 'string')])
+    >>> expr = table.string_col.translate('a', 'b')
+    >>> expr = table.string_col.translate('a', 'bc')
+
     Returns
     -------
     translated : string
@@ -1315,9 +1449,11 @@ def _lpad(self, length, pad=' '):
 
     Examples
     --------
-    table.strings.lpad(5, '-')
-    'a' becomes '----a'
-    'abcdefg' becomes 'abcde'
+    >>> import ibis
+    >>> table = ibis.table([('strings', 'string')])
+    >>> expr = table.strings.lpad(5, '-')
+    >>> expr = ibis.literal('a').lpad(5, '-')  # 'a' becomes '----a'
+    >>> expr = ibis.literal('abcdefg').lpad(5, '-')  # 'abcdefg' becomes 'abcde'  # noqa: E501
 
     Returns
     -------
@@ -1338,9 +1474,11 @@ def _rpad(self, length, pad=' '):
 
     Examples
     --------
-    table.strings.rpad(5, '-')
-    'a' becomes 'a----'
-    'abcdefg' becomes 'abcde'
+    >>> import ibis
+    >>> table = ibis.table([('string_col', 'string')])
+    >>> expr = table.string_col.rpad(5, '-')
+    >>> expr = ibis.literal('a').rpad(5, '-')  # 'a' becomes 'a----'
+    >>> expr = ibis.literal('abcdefg').rpad(5, '-')  # 'abcdefg' becomes 'abcde'  # noqa: E501
 
     Returns
     -------
@@ -1362,7 +1500,9 @@ def _find_in_set(self, str_list):
 
     Examples
     --------
-    table.strings.find_in_set(['a', 'b'])
+    >>> import ibis
+    >>> table = ibis.table([('strings', 'string')])
+    >>> result = table.strings.find_in_set(['a', 'b'])
 
     Returns
     -------
@@ -1381,8 +1521,9 @@ def _string_join(self, strings):
 
     Examples
     --------
-    sep = ibis.literal(',')
-    sep.join(['a','b','c'])
+    >>> import ibis
+    >>> sep = ibis.literal(',')
+    >>> result = sep.join(['a', 'b', 'c'])
 
     Returns
     -------
@@ -1391,7 +1532,7 @@ def _string_join(self, strings):
     return _ops.StringJoin(self, strings).to_expr()
 
 
-def _string_like(self, pattern):
+def _string_like(self, patterns):
     """
     Wildcard fuzzy matching function equivalent to the SQL LIKE directive. Use
     % as a multiple-character wildcard or _ (underscore) as a single-character
@@ -1401,13 +1542,22 @@ def _string_like(self, pattern):
 
     Parameters
     ----------
-    pattern : string
+    pattern : str or List[str]
+        A pattern or list of patterns to match. If `pattern` is a list, then if
+        **any** pattern matches the input then the corresponding row in the
+        output is ``True``.
 
     Returns
     -------
-    matched : boolean value
+    matched : ir.BooleanColumn
     """
-    return _ops.StringSQLLike(self, pattern).to_expr()
+    return functools.reduce(
+        operator.or_,
+        (
+            _ops.StringSQLLike(self, pattern).to_expr()
+            for pattern in util.promote_list(patterns)
+        )
+    )
 
 
 def re_search(arg, pattern):
@@ -1455,8 +1605,9 @@ def regex_replace(arg, pattern, replacement):
 
     Examples
     --------
-    table.strings.replace('(b+)', r'<\1>')
-    'aaabbbaa' becomes 'aaa<bbb>aaa'
+    >>> import ibis
+    >>> table = ibis.table([('strings', 'string')])
+    >>> result = table.strings.replace('(b+)', r'<\1>')  # 'aaabbbaa' becomes 'aaa<bbb>aaa'  # noqa: E501
 
     Returns
     -------
@@ -1477,8 +1628,9 @@ def _string_replace(arg, pattern, replacement):
 
     Examples
     --------
-    table.strings.replace('aaa', 'foo')
-    'aaabbbaaa' becomes 'foobbbfoo'
+    >>> import ibis
+    >>> table = ibis.table([('strings', 'string')])
+    >>> result = table.strings.replace('aaa', 'foo')  # 'aaabbbaaa' becomes 'foobbbfoo'  # noqa: E501
 
     Returns
     -------
@@ -1502,8 +1654,9 @@ def parse_url(arg, extract, key=None):
 
     Examples
     --------
-    parse_url("https://www.youtube.com/watch?v=kEuEcWfewf8&t=10", 'QUERY', 'v')
-    yields 'kEuEcWfewf8'
+    >>> url = "https://www.youtube.com/watch?v=kEuEcWfewf8&t=10"
+    >>> parse_url(url, 'QUERY', 'v')  # doctest: +SKIP
+    'kEuEcWfewf8'
 
     Returns
     -------
@@ -1518,11 +1671,11 @@ def _string_contains(arg, substr):
 
     Parameters
     ----------
-    substr
+    substr : str or ibis.expr.types.StringValue
 
     Returns
     -------
-    contains : boolean
+    contains : ibis.expr.types.BooleanValue
     """
     return arg.find(substr) >= 0
 
@@ -1582,10 +1735,109 @@ _string_value_methods = dict(
     join=_string_join,
     lpad=_lpad,
     rpad=_rpad,
+    __add__=add,
+    __mul__=mul,
+    __rmul__=mul,
 )
 
 
 _add_methods(StringValue, _string_value_methods)
+
+
+# ---------------------------------------------------------------------
+# Array API
+
+
+def _array_slice(array, index):
+    """Slice or index `array` at `index`.
+
+    Parameters
+    ----------
+    index : int or ibis.expr.types.IntegerValue or slice
+
+    Returns
+    -------
+    sliced_array : ibis.expr.types.ValueExpr
+        If `index` is an ``int`` or :class:`~ibis.expr.types.IntegerValue` then
+        the return type is the element type of `array`. If `index` is a
+        ``slice`` then the return type is the same type as the input.
+    """
+    if isinstance(index, slice):
+        start = index.start
+        stop = index.stop
+        if ((start is not None and start < 0) or
+                (stop is not None and stop < 0)):
+            raise ValueError('negative slicing not yet supported')
+
+        step = index.step
+
+        if step is not None and step != 1:
+            raise NotImplementedError('step can only be 1')
+
+        op = _ops.ArraySlice(
+            array,
+            start if start is not None else 0,
+            stop,
+        )
+    else:
+        op = _ops.ArrayIndex(array, index)
+    return op.to_expr()
+
+
+_array_column_methods = dict(
+    length=_unary_op('length', _ops.ArrayLength),
+    __getitem__=_array_slice,
+    __add__=_binop_expr('__add__', _ops.ArrayConcat),
+    __radd__=toolz.flip(_binop_expr('__radd__', _ops.ArrayConcat)),
+    __mul__=_binop_expr('__mul__', _ops.ArrayRepeat),
+    __rmul__=_binop_expr('__rmul__', _ops.ArrayRepeat),
+)
+
+_add_methods(ArrayValue, _array_column_methods)
+
+# ---------------------------------------------------------------------
+# Map API
+
+
+_map_column_methods = dict(
+    length=_unary_op('length', _ops.MapLength),
+    __getitem__=_binop_expr('__getitem__', _ops.MapValueForKey),
+    keys=_unary_op('keys', _ops.MapKeys),
+    values=_unary_op('values', _ops.MapValues),
+    __add__=_binop_expr('__add__', _ops.MapConcat),
+    __radd__=toolz.flip(_binop_expr('__radd__', _ops.MapConcat)),
+)
+
+_add_methods(MapValue, _map_column_methods)
+
+# ---------------------------------------------------------------------
+# Struct API
+
+
+def _struct_get_field(expr, field_name):
+    """Get the `field_name` field from the ``Struct`` expression `expr`.
+
+    Parameters
+    ----------
+    field_name : str
+        The name of the field to access from the ``Struct`` typed expression
+        `expr`. Must be a Python ``str`` type; programmatic struct field
+        access is not yet supported.
+
+    Returns
+    -------
+    value_expr : ibis.expr.types.ValueExpr
+        An expression with the type of the field being accessed.
+    """
+    return _ops.StructField(expr, field_name).to_expr()
+
+
+_struct_column_methods = dict(
+    __getattr__=_struct_get_field,
+    __getitem__=_struct_get_field,
+)
+
+_add_methods(StructValue, _struct_column_methods)
 
 
 # ---------------------------------------------------------------------
@@ -1631,6 +1883,22 @@ def _timestamp_strftime(arg, format_str):
     return _ops.Strftime(arg, format_str).to_expr()
 
 
+def _timestamp_time(arg):
+    """
+    Return a Time node for a Timestamp
+    We can then perform certain operations on this node
+    w/o actually instantiating the underlying structure
+    (which is inefficient in pandas/numpy)
+
+    Returns
+    -------
+    Time node
+    """
+    if PY2:
+        raise ValueError("time support is not enabled on python 2")
+    return _ops.Time(arg).to_expr()
+
+
 _timestamp_value_methods = dict(
     strftime=_timestamp_strftime,
     year=_extract_field('year', _ops.ExtractYear),
@@ -1640,11 +1908,64 @@ _timestamp_value_methods = dict(
     minute=_extract_field('minute', _ops.ExtractMinute),
     second=_extract_field('second', _ops.ExtractSecond),
     millisecond=_extract_field('millisecond', _ops.ExtractMillisecond),
-    truncate=_timestamp_truncate
+    truncate=_timestamp_truncate,
+    time=_timestamp_time,
+)
+
+
+_date_value_methods = dict(
+    strftime=_timestamp_strftime,
+    year=_extract_field('year', _ops.ExtractYear),
+    month=_extract_field('month', _ops.ExtractMonth),
+    day=_extract_field('day', _ops.ExtractDay),
 )
 
 
 _add_methods(TimestampValue, _timestamp_value_methods)
+_add_methods(DateValue, _date_value_methods)
+
+
+# ---------------------------------------------------------------------
+# Time API
+
+def between_time(arg, lower, upper, timezone=None):
+    """
+    Check if the input expr falls between the lower/upper bounds
+    passed. Bounds are inclusive. All arguments must be comparable.
+
+    Parameters
+    ----------
+    lower : str, datetime.time
+    upper : str, datetime.time
+    timezone : str, timezone, default None
+
+    Returns
+    -------
+    is_between : BooleanValue
+    """
+
+    if isinstance(arg.op(), _ops.Time):
+        # Here we pull out the first argument to the underlying Time operation
+        # which is by definition (in _timestamp_value_methods) a
+        # TimestampValue. We do this so that we can potentially specialize the
+        # "between time" operation for timestamp_value_expr.time().between().
+        # A similar mechanism is triggered when creating expressions like
+        # t.column.distinct().count(), which is turned into t.column.nunique().
+        arg = arg.op().args[0]
+        if timezone is not None:
+            arg = arg.cast(dt.Timestamp(timezone=timezone))
+        op = _ops.BetweenTime(arg, lower, upper)
+    else:
+        op = _ops.Between(arg, lower, upper)
+
+    return op.to_expr()
+
+
+_time_value_methods = dict(
+    between=between_time,
+)
+
+_add_methods(TimeValue, _time_value_methods)
 
 
 # ---------------------------------------------------------------------
@@ -1676,7 +1997,10 @@ _add_methods(CategoryValue, _category_value_methods)
 _join_classes = {
     'inner': _ops.InnerJoin,
     'left': _ops.LeftJoin,
+    'any_inner': _ops.AnyInnerJoin,
+    'any_left': _ops.AnyLeftJoin,
     'outer': _ops.OuterJoin,
+    'right': _ops.RightJoin,
     'left_semi': _ops.LeftSemiJoin,
     'semi': _ops.LeftSemiJoin,
     'anti': _ops.LeftAntiJoin,
@@ -1698,6 +2022,7 @@ def join(left, right, predicates=(), how='inner'):
       - 'inner': inner join
       - 'left': left join
       - 'outer': full outer join
+      - 'right': right outer join
       - 'semi' or 'left_semi': left semi join
       - 'anti': anti join
 
@@ -1708,35 +2033,102 @@ def join(left, right, predicates=(), how='inner'):
     """
     klass = _join_classes[how.lower()]
     if isinstance(predicates, Expr):
-        predicates = _L.unwrap_ands(predicates)
+        predicates = _L.flatten_predicate(predicates)
 
     op = klass(left, right, predicates)
     return TableExpr(op)
 
 
-def cross_join(*args, **kwargs):
+def asof_join(left, right, predicates=(), by=()):
+    """
+    Perform an asof join between two tables.  Similar to a left join
+    except that the match is done on nearest key rather than equal keys.
+
+    Optionally, match keys with 'by' before joining with predicates.
+
+    Parameters
+    ----------
+    left : TableExpr
+    right : TableExpr
+    predicates : join expression(s)
+    by : string
+      column to group by before joining
+
+    Returns
+    -------
+    joined : TableExpr
+      Note, schema is not materialized yet
+    """
+    return _ops.AsOfJoin(left, right, predicates, by).to_expr()
+
+
+def cross_join(*tables, **kwargs):
     """
     Perform a cross join (cartesian product) amongst a list of tables, with
     optional set of prefixes to apply to overlapping column names
 
     Parameters
     ----------
-    positional args: tables to join
-    prefixes keyword : prefixes for each table
-      Not yet implemented
-
-    Examples
-    --------
-    >>> joined1 = ibis.cross_join(a, b, c, d, e)
-    >>> joined2 = ibis.cross_join(a, b, c, prefixes=['a_', 'b_', 'c_']))
+    tables : ibis.expr.types.TableExpr
 
     Returns
     -------
     joined : TableExpr
-      If prefixes not provided, the result schema is not yet materialized
+
+    Examples
+    --------
+    >>> import ibis
+    >>> schemas = [(name, 'int64') for name in 'abcde']
+    >>> a, b, c, d, e = [
+    ...     ibis.table([(name, type)], name=name) for name, type in schemas
+    ... ]
+    >>> joined1 = ibis.cross_join(a, b, c, d, e)
+    >>> joined1  # doctest: +NORMALIZE_WHITESPACE
+    ref_0
+    UnboundTable[table]
+      name: a
+      schema:
+        a : int64
+    ref_1
+    UnboundTable[table]
+      name: b
+      schema:
+        b : int64
+    ref_2
+    UnboundTable[table]
+      name: c
+      schema:
+        c : int64
+    ref_3
+    UnboundTable[table]
+      name: d
+      schema:
+        d : int64
+    ref_4
+    UnboundTable[table]
+      name: e
+      schema:
+        e : int64
+    CrossJoin[table]
+      left:
+        Table: ref_0
+      right:
+        CrossJoin[table]
+          left:
+            CrossJoin[table]
+              left:
+                CrossJoin[table]
+                  left:
+                    Table: ref_1
+                  right:
+                    Table: ref_2
+              right:
+                Table: ref_3
+          right:
+            Table: ref_4
     """
-    op = _ops.CrossJoin(*args, **kwargs)
-    return TableExpr(op)
+    # TODO(phillipc): Implement prefix keyword argument
+    return TableExpr(_ops.CrossJoin(*tables, **kwargs))
 
 
 def _table_count(self):
@@ -1765,17 +2157,9 @@ def _table_info(self, buf=None):
     types = ['Type', '----'] + [repr(x) for x in self.schema().types]
     counts = ['Non-null #', '----------'] + [str(x) for x in metrics[1:]]
     col_metrics = util.adjoin(2, names, types, counts)
+    result = 'Table rows: {}\n\n{}'.format(metrics[0], col_metrics)
 
-    result = ('Table rows: {0}\n\n'
-              '{1}'
-              .format(metrics[0], col_metrics))
-
-    if buf is None:
-        import sys
-        sys.stdout.write(result)
-        sys.stdout.write('\n')
-    else:
-        buf.write(result)
+    print(result, file=buf)
 
 
 def _table_set_column(table, name, expr):
@@ -1843,7 +2227,7 @@ def filter(table, predicates):
 
 def _resolve_predicates(table, predicates):
     if isinstance(predicates, Expr):
-        predicates = _L.unwrap_ands(predicates)
+        predicates = _L.flatten_predicate(predicates)
     predicates = util.promote_list(predicates)
     predicates = [ir.bind_expr(table, x) for x in predicates]
     resolved_predicates = []
@@ -1895,12 +2279,12 @@ def _table_distinct(self):
 def _table_limit(table, n, offset=0):
     """
     Select the first n rows at beginning of table (may not be deterministic
-    depending on implementatino and presence of a sorting).
+    depending on implementation and presence of a sorting).
 
     Parameters
     ----------
     n : int
-      Rows to include
+      Number of rows to include
     offset : int, default 0
       Number of rows to skip first
 
@@ -1910,6 +2294,27 @@ def _table_limit(table, n, offset=0):
     """
     op = _ops.Limit(table, n, offset=offset)
     return TableExpr(op)
+
+
+def _head(table, n=5):
+    """
+    Select the first n rows at beginning of a table (may not be deterministic
+    depending on implementation and presence of a sorting).
+
+    Parameters
+    ----------
+    n : int
+      Number of rows to include, defaults to 5
+
+    Returns
+    -------
+    limited : TableExpr
+
+    See Also
+    --------
+    ibis.expr.types.TableExpr.limit
+    """
+    return _table_limit(table, n=n)
 
 
 def _table_sort_by(table, sort_exprs):
@@ -1927,7 +2332,9 @@ def _table_sort_by(table, sort_exprs):
 
     Examples
     --------
-    sorted = table.sort_by([('a', True), ('b', False)])
+    >>> import ibis
+    >>> t = ibis.table([('a', 'int64'), ('b', 'string')])
+    >>> ab_sorted = t.sort_by([('a', True), ('b', False)])
 
     Returns
     -------
@@ -1991,7 +2398,7 @@ def mutate(table, exprs=None, **kwds):
 
     Examples
     --------
-    expr = table.mutate(qux=table.foo + table.bar, baz=5)
+    >>> expr = table.mutate(qux=table.foo + table.bar, baz=5)  # doctest: +SKIP
 
     Returns
     -------
@@ -2134,6 +2541,7 @@ _table_methods = dict(
     drop=_table_drop,
     info=_table_info,
     limit=_table_limit,
+    head=_head,
     set_column=_table_set_column,
     filter=filter,
     materialize=_table_materialize,
@@ -2145,9 +2553,12 @@ _table_methods = dict(
     cross_join=cross_join,
     inner_join=_regular_join_method('inner_join', 'inner'),
     left_join=_regular_join_method('left_join', 'left'),
+    any_inner_join=_regular_join_method('any_inner_join', 'any_inner'),
+    any_left_join=_regular_join_method('any_left_join', 'any_left'),
     outer_join=_regular_join_method('outer_join', 'outer'),
     semi_join=_regular_join_method('semi_join', 'semi'),
     anti_join=_regular_join_method('anti_join', 'anti'),
+    asof_join=asof_join,
     sort_by=_table_sort_by,
     to_array=_table_to_array,
     union=_table_union,

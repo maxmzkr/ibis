@@ -14,16 +14,13 @@
 
 import pytest
 
-from ibis.expr.types import ArrayExpr, TableExpr, RelationError
+from ibis.compat import pickle
+from ibis.expr.types import ColumnExpr, TableExpr, RelationError
 from ibis.common import ExpressionError
-from ibis.expr.datatypes import array_type
 import ibis.expr.api as api
 import ibis.expr.types as ir
 import ibis.expr.operations as ops
 import ibis
-
-from ibis.compat import unittest
-from ibis.expr.tests.mocks import MockConnection
 
 import ibis.common as com
 import ibis.config as config
@@ -68,8 +65,7 @@ def test_getitem_column_select(table, schema_dict):
         col = table[k]
 
         # Make sure it's the right type
-        assert isinstance(col, ArrayExpr)
-        assert isinstance(col, array_type(v))
+        assert isinstance(col, ColumnExpr)
 
         # Ensure we have a field selection with back-reference to the table
         parent = col.parent()
@@ -86,7 +82,7 @@ def test_getitem_attribute(table):
     # Project and add a name that conflicts with a TableExpr built-in
     # attribute
     view = table[[table, table['a'].name('schema')]]
-    assert not isinstance(view.schema, ArrayExpr)
+    assert not isinstance(view.schema, ColumnExpr)
 
 
 def test_projection(table):
@@ -156,11 +152,12 @@ def test_projection_unnamed_literal_interactive_blowup(con):
             assert 'named' in e.args[0]
 
 
+@pytest.mark.xfail(raises=AssertionError, reason='NYT')
 def test_projection_of_aggregated(table):
     # Fully-formed aggregations "block"; in a projection, column
     # expressions referencing table expressions below the aggregation are
     # invalid.
-    pass
+    assert False
 
 
 def test_projection_with_star_expr(table):
@@ -230,11 +227,13 @@ def test_add_column(table):
     assert_equal(result, expected)
 
 
+@pytest.mark.xfail(raises=AssertionError, reason='NYT')
 def test_add_column_scalar_expr(table):
     # Check literals, at least
-    pass
+    assert False
 
 
+@pytest.mark.xfail(raises=AssertionError, reason='NYT')
 def test_add_column_aggregate_crossjoin(table):
     # A new column that depends on a scalar value produced by this or some
     # other table.
@@ -245,7 +244,7 @@ def test_add_column_aggregate_crossjoin(table):
     #
     # Here, VAL could be something produced by aggregating table1 or any
     # other table for that matter.
-    pass
+    assert False
 
 
 def test_add_column_existing_projection(table):
@@ -277,6 +276,7 @@ def test_mutate_alter_existing_columns(table):
 
     expected = table['a', 'b', 'c', 'd', 'e',
                           new_f.name('f'), 'g', 'h',
+                          'i',
                           foo.name('foo')]
 
     assert_equal(expr, expected)
@@ -461,7 +461,7 @@ def test_sum_expr_basics(table, int_col):
     # Impala gives bigint for all integer types
     ex_class = api.Int64Scalar
     result = table[int_col].sum()
-    assert isinstance(result, api.Int64Scalar)
+    assert isinstance(result, ex_class)
     assert isinstance(result.op(), ops.Sum)
 
 
@@ -469,7 +469,7 @@ def test_sum_expr_basics_floats(table, float_col):
     # Impala gives double for all floating point types
     ex_class = api.DoubleScalar
     result = table[float_col].sum()
-    assert isinstance(result, api.DoubleScalar)
+    assert isinstance(result, ex_class)
     assert isinstance(result.op(), ops.Sum)
 
 
@@ -480,22 +480,26 @@ def test_mean_expr_basics(table, numeric_col):
 
 
 def test_aggregate_no_keys(table):
-    agg_exprs = [table['a'].sum().name('sum(a)'),
-                 table['c'].mean().name('mean(c)')]
+    metrics = [
+        table['a'].sum().name('sum(a)'),
+        table['c'].mean().name('mean(c)'),
+    ]
 
     # A TableExpr, which in SQL at least will yield a table with a single
     # row
-    result = table.aggregate(agg_exprs)
+    result = table.aggregate(metrics)
     assert isinstance(result, TableExpr)
 
 
 def test_aggregate_keys_basic(table):
-    agg_exprs = [table['a'].sum().name('sum(a)'),
-                 table['c'].mean().name('mean(c)')]
+    metrics = [
+        table['a'].sum().name('sum(a)'),
+        table['c'].mean().name('mean(c)'),
+    ]
 
     # A TableExpr, which in SQL at least will yield a table with a single
     # row
-    result = table.aggregate(agg_exprs, by=['g'])
+    result = table.aggregate(metrics, by=['g'])
     assert isinstance(result, TableExpr)
 
     # it works!
@@ -544,9 +548,10 @@ def test_summary_expand_list(table):
     assert_equal(result, expected)
 
 
+@pytest.mark.xfail(raises=AssertionError, reason='NYT')
 def test_aggregate_invalid(table):
     # Pass a non-aggregation or non-scalar expr
-    pass
+    assert False
 
 
 def test_filter_aggregate_pushdown_predicate(table):
@@ -567,8 +572,9 @@ def test_filter_aggregate_pushdown_predicate(table):
     assert_equal(filtered, expected)
 
 
+@pytest.mark.xfail(raises=AssertionError, reason='NYT')
 def test_filter_aggregate_partial_pushdown(table):
-    pass
+    assert False
 
 
 def test_aggregate_post_predicate(table):
@@ -608,8 +614,9 @@ def test_group_by_kwargs(table):
     assert_equal(expr, expected)
 
 
+@pytest.mark.xfail(raises=AssertionError, reason='NYT')
 def test_aggregate_root_table_internal(table):
-    pass
+    assert False
 
 
 def test_compound_aggregate_expr(table):
@@ -721,6 +728,24 @@ def test_join_no_predicate_list(con):
     joined = region.inner_join(nation, pred)
     expected = region.inner_join(nation, [pred])
     assert_equal(joined, expected)
+
+
+def test_asof_join():
+    left = ibis.table([('time', 'int32'), ('value', 'double')])
+    right = ibis.table([('time', 'int32'), ('value2', 'double')])
+    joined = api.asof_join(left, right, 'time')
+    pred = joined.op().predicates[0].op()
+    assert pred.left.op().name == pred.right.op().name == 'time'
+
+
+def test_asof_join_with_by():
+    left = ibis.table(
+        [('time', 'int32'), ('key', 'int32'), ('value', 'double')])
+    right = ibis.table(
+        [('time', 'int32'), ('key', 'int32'), ('value2', 'double')])
+    joined = api.asof_join(left, right, 'time', by='key')
+    by = joined.op().by_predicates[0].op()
+    assert by.left.op().name == by.right.op().name == 'key'
 
 
 def test_equijoin_schema_merge():
@@ -870,9 +895,11 @@ def test_semi_join_schema(table):
 
 
 def test_cross_join(table):
-    agg_exprs = [table['a'].sum().name('sum_a'),
-                 table['b'].mean().name('mean_b')]
-    scalar_aggs = table.aggregate(agg_exprs)
+    metrics = [
+        table['a'].sum().name('sum_a'),
+        table['b'].mean().name('mean_b'),
+    ]
+    scalar_aggs = table.aggregate(metrics)
 
     joined = table.cross_join(scalar_aggs).materialize()
     agg_schema = api.Schema(['sum_a', 'mean_b'], ['int64', 'double'])
@@ -890,9 +917,10 @@ def test_cross_join_multiple(table):
     assert joined.equals(expected)
 
 
+@pytest.mark.xfail(raises=AssertionError, reason='NYT')
 def test_join_compound_boolean_predicate(table):
     # The user might have composed predicates through logical operations
-    pass
+    assert False
 
 
 def test_filter_join_unmaterialized(table):
@@ -955,6 +983,18 @@ def test_join_invalid_refs(con):
         t1.inner_join(t2, [predicate])
 
 
+def test_join_invalid_expr_type(con):
+    left = con.table('star1')
+    invalid_right = left.foo_id
+    join_key = ['bar_id']
+
+    with pytest.raises(TypeError) as e:
+        left.inner_join(invalid_right, join_key)
+
+    message = str(e)
+    assert type(invalid_right).__name__ in message
+
+
 def test_join_non_boolean_expr(con):
     t1 = con.table('star1')
     t2 = con.table('star2')
@@ -989,12 +1029,14 @@ def test_unravel_compound_equijoin(table):
     assert_equal(joined, expected)
 
 
+@pytest.mark.xfail(raises=AssertionError, reason='NYT')
 def test_join_add_prefixes(table):
-    pass
+    assert False
 
 
+@pytest.mark.xfail(raises=AssertionError, reason='NYT')
 def test_join_nontrivial_exprs(table):
-    pass
+    assert False
 
 
 def test_union(table):
@@ -1063,7 +1105,7 @@ def t2():
 def test_simple_existence_predicate(t1, t2):
     cond = (t1.key1 == t2.key1).any()
 
-    assert isinstance(cond, ir.BooleanArray)
+    assert isinstance(cond, ir.BooleanColumn)
     op = cond.op()
     assert isinstance(op, ops.Any)
 
@@ -1072,9 +1114,10 @@ def test_simple_existence_predicate(t1, t2):
     assert isinstance(expr.op(), ops.Selection)
 
 
+@pytest.mark.xfail(raises=AssertionError, reason='NYT')
 def test_cannot_use_existence_expression_in_join(table):
     # Join predicates must consist only of comparisons
-    pass
+    assert False
 
 
 def test_not_exists_predicate(t1, t2):
@@ -1142,7 +1185,7 @@ def test_filter(table):
     assert_equal(result, expected)
 
 
-def test_sort_by(table):
+def test_sort_by2(table):
     m = table.mutate(foo=table.e + table.f)
 
     result = m.sort_by(lambda x: -x.foo)
@@ -1158,7 +1201,7 @@ def test_sort_by(table):
     assert_equal(result, expected)
 
 
-def test_projection(table):
+def test_projection2(table):
     m = table.mutate(foo=table.f * 2)
 
     def f(x):
@@ -1171,7 +1214,7 @@ def test_projection(table):
     assert_equal(result2, expected)
 
 
-def test_mutate(table):
+def test_mutate2(table):
     m = table.mutate(foo=table.f * 2)
 
     def g(x):
@@ -1188,7 +1231,7 @@ def test_mutate(table):
     assert_equal(result, expected)
 
 
-def test_add_column(table):
+def test_add_column2(table):
     def g(x):
         return x.f * 2
 
@@ -1228,3 +1271,11 @@ def test_set_column(table):
     result = table.set_column('f', g)
     expected = table.set_column('f', table.f * 2)
     assert_equal(result, expected)
+
+
+def test_pickle_table_expr():
+    schema = [('time', 'timestamp'), ('key', 'string'), ('value', 'double')]
+    t0 = ibis.table(schema, name='t0')
+    raw = pickle.dumps(t0)
+    t1 = pickle.loads(raw)
+    assert t1.equals(t0)

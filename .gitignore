@@ -10,6 +10,7 @@
 *.log
 *.swp
 *.pdb
+.idea
 
 # Compiled source
 *.a
@@ -55,3 +56,5 @@ testing/udf/Makefile
 # test data
 scripts/ibis-testing*
 ibis_testing*
+.tox/
+.asv/

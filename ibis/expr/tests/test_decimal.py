@@ -16,28 +16,15 @@ import ibis.expr.api as api
 import ibis.expr.types as ir
 import ibis.expr.operations as ops
 
-from ibis.compat import unittest
-from ibis.expr.tests.mocks import MockConnection
-
-
 import pytest
-
-@pytest.fixture
-def con():
-    return MockConnection()
-
-
-@pytest.fixture
-def lineitem(con):
-    return con.table('tpch_lineitem')
 
 
 def test_type_metadata(lineitem):
     col = lineitem.l_extendedprice
-    assert isinstance(col, ir.DecimalArray)
+    assert isinstance(col, ir.DecimalColumn)
 
-    assert col._precision == 12
-    assert col._scale == 2
+    assert col.meta.precision == 12
+    assert col.meta.scale == 2
 
 
 def test_cast_scalar_to_decimal():
@@ -45,8 +32,8 @@ def test_cast_scalar_to_decimal():
 
     casted = val.cast('decimal(15,5)')
     assert isinstance(casted, ir.DecimalScalar)
-    assert casted._precision == 15
-    assert casted._scale == 5
+    assert casted.meta.precision == 15
+    assert casted.meta.scale == 5
 
 
 def test_decimal_aggregate_function_behavior(lineitem):
@@ -61,8 +48,8 @@ def test_decimal_aggregate_function_behavior(lineitem):
     for func_name in functions:
         result = getattr(col, func_name)()
         assert isinstance(result, ir.DecimalScalar)
-        assert result._precision == col._precision
-        assert result._scale == 38
+        assert result.meta.precision == col.meta.precision
+        assert result.meta.scale == 38
 
 
 def test_where(lineitem):
@@ -72,11 +59,11 @@ def test_where(lineitem):
     expr = api.where(table.l_discount > 0,
                      q * table.l_discount, api.null)
 
-    assert isinstance(expr, ir.DecimalArray)
+    assert isinstance(expr, ir.DecimalColumn)
 
     expr = api.where(table.l_discount > 0,
                      (q * table.l_discount).sum(), api.null)
-    assert isinstance(expr, ir.DecimalArray)
+    assert isinstance(expr, ir.DecimalColumn)
 
     expr = api.where(table.l_discount.sum() > 0,
                      (q * table.l_discount).sum(), api.null)
@@ -85,10 +72,10 @@ def test_where(lineitem):
 
 def test_fillna(lineitem):
     expr = lineitem.l_extendedprice.fillna(0)
-    assert isinstance(expr, ir.DecimalArray)
+    assert isinstance(expr, ir.DecimalColumn)
 
     expr = lineitem.l_extendedprice.fillna(lineitem.l_quantity)
-    assert isinstance(expr, ir.DecimalArray)
+    assert isinstance(expr, ir.DecimalColumn)
 
 
 def test_precision_scale(lineitem):
@@ -112,13 +99,14 @@ def test_invalid_precision_scale_combo():
 def test_decimal_str(lineitem):
     col = lineitem.l_extendedprice
     t = col.type()
-    assert str(t) == 'decimal({0:d}, {1:d})'.format(t.precision, t.scale)
+    assert str(t) == 'decimal({:d}, {:d})'.format(t.precision, t.scale)
 
 
 def test_decimal_repr(lineitem):
     col = lineitem.l_extendedprice
     t = col.type()
-    assert repr(t) == 'Decimal(precision={0:d}, scale={1:d})'.format(
+    expected = 'Decimal(precision={:d}, scale={:d}, nullable=True)'.format(
         t.precision,
         t.scale,
     )
+    assert repr(t) == expected

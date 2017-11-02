@@ -14,77 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-COMMS_EXT_ENABLED = False
+import os
 
-requirements = []
-extensions = []
-cmdclass = {}
+from setuptools import setup, find_packages
 
-if COMMS_EXT_ENABLED:
-    requirements.append('cython >= 0.21')
+import versioneer
 
-    from Cython.Distutils import build_ext
-    from Cython.Build import cythonize
-    import Cython
-
-    if Cython.__version__ < '0.19.1':
-        raise Exception('Please upgrade to Cython 0.19.1 or newer')
-
-    cmdclass['build_ext'] = build_ext
-
-from setuptools import setup  # noqa
-import os  # noqa
-import sys  # noqa
-
-from distutils.extension import Extension  # noqa
-
-
-from distutils.command.clean import clean as _clean  # noqa
-
-
-class clean(_clean):
-    def run(self):
-        _clean.run(self)
-        for x in []:
-            try:
-                os.remove(x)
-            except OSError:
-                pass
-
-cmdclass['clean'] = clean
-
-with open('requirements.txt') as f:
-    file_reqs = f.read().splitlines()
-    requirements = requirements + file_reqs
-
-PY2 = sys.version_info[0] == 2
-PY26 = sys.version_info[0] == 2 and sys.version_info[1] == 6
-if PY26:
-    requirements.append('argparse')
-    requirements.append('unittest2')
-
-if PY2:
-    requirements.append('mock')
-
-
-if COMMS_EXT_ENABLED:
-    import numpy as np
-
-    common_include = ['ibis/src', np.get_include()]
-    comms_ext_libraries = []
-    if sys.platform != 'darwin':
-        # libuuid is available without additional linking as part of the base
-        # BSD system on OS X, needs to be installed and linked on Linux,
-        # though.
-        comms_ext_libraries.append('uuid')
-
-    comms_ext = Extension('ibis.comms',
-                          ['ibis/comms.pyx',
-                           'ibis/src/ipc_support.c'],
-                          depends=['ibis/src/ipc_support.h'],
-                          libraries=comms_ext_libraries,
-                          include_dirs=common_include)
-    extensions = cythonize([comms_ext])
 
 LONG_DESCRIPTION = """
 Ibis is a productivity-centric Python big data framework.
@@ -92,54 +27,81 @@ Ibis is a productivity-centric Python big data framework.
 See http://ibis-project.org
 """
 
-CLASSIFIERS = [
-    'Development Status :: 4 - Beta',
-    'Operating System :: OS Independent',
-    'Intended Audience :: Science/Research',
-    'Programming Language :: Python',
-    'Programming Language :: Python :: 2',
-    'Programming Language :: Python :: 3',
-    'Programming Language :: Python :: 2.6',
-    'Programming Language :: Python :: 2.7',
-    'Programming Language :: Cython',
-    'Topic :: Scientific/Engineering',
+impala_requires = [
+    'hdfs>=2.0.0',
+    'impyla>=0.13.7',
+    'sqlalchemy>=1.0.0',
+    'thrift<=0.9.3',
 ]
 
-import versioneer  # noqa
+sqlite_requires = ['sqlalchemy>=1.0.0']
+postgres_requires = sqlite_requires + ['psycopg2']
+kerberos_requires = ['requests-kerberos']
+visualization_requires = ['graphviz']
+pandas_requires = ['multipledispatch']
+clickhouse_requires = ['clickhouse-driver>=0.0.8']
+bigquery_requires = ['google-cloud-bigquery<0.28']
+
+all_requires = (
+    impala_requires +
+    postgres_requires +
+    kerberos_requires +
+    visualization_requires +
+    pandas_requires +
+    clickhouse_requires +
+    bigquery_requires
+)
+
+develop_requires = all_requires + [
+    'click',
+    'flake8',
+    'pytest>=3',
+]
+
+with open('requirements.txt', 'rt') as f:
+    install_requires = list(map(str.strip, f))
 
 setup(
     name='ibis-framework',
-    packages=['ibis',
-              'ibis.expr',
-              'ibis.expr.tests',
-              'ibis.hive',
-              'ibis.hive.tests',
-              'ibis.impala',
-              'ibis.impala.tests',
-              'ibis.spark',
-              'ibis.spark.tests',
-              'ibis.sql',
-              'ibis.sql.tests',
-              'ibis.sql.postgres',
-              'ibis.sql.postgres.tests',
-              'ibis.sql.presto',
-              'ibis.sql.presto.tests',
-              'ibis.sql.redshift',
-              'ibis.sql.redshift.tests',
-              'ibis.sql.sqlite',
-              'ibis.sql.sqlite.tests',
-              'ibis.sql.vertica',
-              'ibis.sql.vertica.tests',
-              'ibis.tests'],
+    packages=find_packages(),
     version=versioneer.get_version(),
-    package_data={'ibis': ['*.pxd', '*.pyx']},
-    ext_modules=extensions,
     cmdclass=versioneer.get_cmdclass(),
-    install_requires=requirements,
-    extras_require={'kerberos': ['requests-kerberos']},
+    install_requires=install_requires,
+    extras_require={
+        'all': all_requires,
+        'develop': develop_requires,
+        'develop:python_version < "3"': develop_requires + [
+            'thriftpy<=0.3.9', 'mock',
+        ],
+        'develop:python_version >= "3"': develop_requires,
+        'impala': impala_requires,
+        'impala:python_version < "3"': impala_requires + ['thriftpy<=0.3.9'],
+        'kerberos': kerberos_requires,
+        'postgres': postgres_requires,
+        'sqlite': sqlite_requires,
+        'visualization': visualization_requires,
+        'pandas': pandas_requires,
+        'clickhouse': clickhouse_requires,
+        'bigquery': bigquery_requires,
+    },
+    scripts=[
+        os.path.relpath(
+            os.path.join('scripts', 'test_data_admin.py'),
+            os.path.dirname(__file__),
+        )
+    ],
     description="Productivity-centric Python Big Data Framework",
     long_description=LONG_DESCRIPTION,
-    classifiers=CLASSIFIERS,
+    classifiers=[
+        'Development Status :: 4 - Beta',
+        'Operating System :: OS Independent',
+        'Intended Audience :: Science/Research',
+        'Programming Language :: Python',
+        'Programming Language :: Python :: 2',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 2.7',
+        'Topic :: Scientific/Engineering',
+    ],
     license='Apache License, Version 2.0',
     maintainer="Wes McKinney",
     maintainer_email="wes@cloudera.com"

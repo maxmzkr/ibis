@@ -12,34 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import unittest
 import os
+
 import pytest
 
-from ibis.compat import unittest
-from ibis.expr.tests.mocks import MockConnection
-from ibis.impala.client import build_ast
-from ibis.impala.tests.common import IbisTestEnv, ImpalaE2E
-from ibis.tests.util import assert_equal
-import ibis.expr.datatypes as dt
-import ibis.util as util
-import ibis
+pytest.importorskip('hdfs')
+pytest.importorskip('sqlalchemy')
+pytest.importorskip('impala.dbapi')
 
-try:
-    from ibis.impala import kudu_support as ksupport
-    import kudu
-    HAVE_KUDU_CLIENT = True
-except ImportError:
-    HAVE_KUDU_CLIENT = False
+ksupport = pytest.importorskip('ibis.impala.kudu_support')
+kudu = pytest.importorskip('kudu')
 
-
-pytestmark = pytest.mark.skipif(not HAVE_KUDU_CLIENT,
-                                reason='Kudu client not installed')
+from ibis.expr.tests.mocks import MockConnection  # noqa: E402
+from ibis.impala.client import build_ast  # noqa: E402
+from ibis.impala.tests.common import IbisTestEnv, ImpalaE2E  # noqa: E402
+from ibis.tests.util import assert_equal  # noqa: E402
+import ibis.expr.datatypes as dt  # noqa: E402
+import ibis.util as util  # noqa: E402
+import ibis  # noqa: E402
 
 
 class KuduImpalaTestEnv(IbisTestEnv):
 
     def __init__(self):
-        IbisTestEnv.__init__(self)
+        super(KuduImpalaTestEnv, self).__init__()
 
         # band-aid until Kudu support merged into Impala mainline
         self.test_host = os.getenv('IBIS_TEST_KIMPALA_HOST',
@@ -56,6 +53,7 @@ class KuduImpalaTestEnv(IbisTestEnv):
                                                50070))
         self.hdfs_superuser = os.environ.get('IBIS_TEST_HDFS_SUPERUSER',
                                              'hdfs')
+
 
 ENV = KuduImpalaTestEnv()
 

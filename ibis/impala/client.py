@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from posixpath import join as pjoin
 import re
 import six
 import threading
 import time
 import weakref
+import traceback
 
-import hdfs
+from posixpath import join as pjoin
+from collections import deque
+
 import numpy as np
 import pandas as pd
 
@@ -40,12 +42,6 @@ import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
 import ibis.util as util
-
-
-if six.PY2:
-    import Queue as queue
-else:
-    import queue
 
 
 class ImpalaDatabase(Database):
@@ -82,9 +78,11 @@ class ImpalaConnection(object):
         self.options = {}
 
         self.max_pool_size = pool_size
-        self._connections = None
+        self._connections = weakref.WeakSet()
 
-        self.reset_connection_pool()
+        self.connection_pool = deque(maxlen=pool_size)
+        self.connection_pool_size = 0
+
         self.ping()
 
     def set_options(self, options):
@@ -94,15 +92,11 @@ class ImpalaConnection(object):
         """
         Close all open Impyla sessions
         """
-        self.reset_connection_pool()
+        for impyla_connection in self._connections:
+            impyla_connection.close()
 
-    def reset_connection_pool(self):
-        if self._connections is not None:
-            for k, con in self._connections.items():
-                con.close()
-        self._connections = weakref.WeakValueDictionary()
-        self.connection_pool = queue.Queue(self.max_pool_size)
-        self.connection_pool_size = 0
+        self._connections.clear()
+        self.connection_pool.clear()
 
     def set_database(self, name):
         self.database = name
@@ -123,14 +117,13 @@ class ImpalaConnection(object):
 
         try:
             cursor.execute(query, async=async)
-        except:
+        except Exception:
             cursor.release()
-
-            import traceback
-            buf = six.StringIO()
-            traceback.print_exc(file=buf)
-            self.error('Exception caused by {0}: {1}'.format(query,
-                                                             buf.getvalue()))
+            self.error(
+                'Exception caused by {}: {}'.format(
+                    query, traceback.format_exc()
+                )
+            )
             raise
 
         return cursor
@@ -148,20 +141,17 @@ class ImpalaConnection(object):
 
     def _get_cursor(self):
         try:
-            cur = self.connection_pool.get(False)
-            if (cur.database != self.database or
-                    cur.options != self.options):
-                cur = self._new_cursor()
-            cur.released = False
-
-            return cur
-        except queue.Empty:
+            cursor = self.connection_pool.popleft()
+        except IndexError:  # deque is empty
             if self.connection_pool_size < self.max_pool_size:
-                cursor = self._new_cursor()
-                self.connection_pool_size += 1
-                return cursor
-            else:
-                raise com.InternalError('Too many concurrent / hung queries')
+                return self._new_cursor()
+            raise com.InternalError('Too many concurrent / hung queries')
+        else:
+            if (cursor.database != self.database or
+                    cursor.options != self.options):
+                return self._new_cursor()
+            cursor.released = False
+            return cursor
 
     def _new_cursor(self):
         params = self.params.copy()
@@ -170,7 +160,7 @@ class ImpalaConnection(object):
             database = self.database
         con = impyla.connect(database=database, **params)
 
-        self._connections[id(con)] = con
+        self._connections.add(con)
 
         # make sure the connection works
         cursor = con.cursor(convert_types=True, user=params.get('user'))
@@ -183,10 +173,10 @@ class ImpalaConnection(object):
         return wrapper
 
     def ping(self):
-        self._new_cursor()
+        self._get_cursor()._cursor.ping()
 
     def release(self, cur):
-        self.connection_pool.put(cur)
+        self.connection_pool.append(cur)
 
 
 class ImpalaCursor(object):
@@ -199,6 +189,7 @@ class ImpalaCursor(object):
         self.database = database
         self.options = options
         self.released = False
+        self.con.connection_pool_size += 1
 
     def __del__(self):
         self._close_cursor()
@@ -304,7 +295,7 @@ class ImpalaQuery(Query):
         names = [x[0] for x in cursor.description]
         return _column_batches_to_dataframe(names, batches)
 
-    def _db_type_to_dtype(self, db_type):
+    def _db_type_to_dtype(self, db_type, column):
         return _HS2_TTypeId_to_dtype[db_type]
 
 
@@ -477,6 +468,7 @@ class ImpalaClient(SQLClient):
     async_query = ImpalaAsyncQuery
 
     def __init__(self, con, hdfs_client=None, **params):
+        import hdfs
         self.con = con
 
         if isinstance(hdfs_client, hdfs.Client):
@@ -491,8 +483,8 @@ class ImpalaClient(SQLClient):
 
         self._ensured = False
 
-    def _build_ast(self, expr):
-        return build_ast(expr)
+    def _build_ast(self, expr, params=None):
+        return build_ast(expr, params=params)
 
     def _get_hdfs(self):
         if self._hdfs is None:
@@ -841,7 +833,7 @@ class ImpalaClient(SQLClient):
 
         Examples
         --------
-        con.create_table('new_table_name', table_expr)
+        >>> con.create_table('new_table_name', table_expr)  # doctest: +SKIP
         """
         if like_parquet is not None:
             raise NotImplementedError
@@ -855,18 +847,12 @@ class ImpalaClient(SQLClient):
             ast = self._build_ast(to_insert)
             select = ast.queries[0]
 
-            if partition is not None:
-                # Fairly certain this is currently the case
-                raise ValueError('partition not supported with '
-                                 'create-table-as-select. Create an '
-                                 'empty partitioned table instead '
-                                 'and insert into those partitions.')
-
             statement = ddl.CTAS(table_name, select,
                                  database=database,
                                  can_exist=force,
                                  format=format,
                                  external=external,
+                                 partition=partition,
                                  path=location)
         elif schema is not None:
             statement = ddl.CreateTableWithSchema(
@@ -1096,10 +1082,11 @@ class ImpalaClient(SQLClient):
 
         Examples
         --------
-        con.insert('my_table', table_expr)
+        >>> table = 'my_table'
+        >>> con.insert(table, table_expr)  # doctest: +SKIP
 
         # Completely overwrite contents
-        con.insert('my_table', table_expr, overwrite=True)
+        >>> con.insert(table, table_expr, overwrite=True)  # doctest: +SKIP
         """
         table = self.table(table_name, database=database)
         return table.insert(obj=obj, overwrite=overwrite, partition=partition,
@@ -1133,7 +1120,9 @@ class ImpalaClient(SQLClient):
 
         Examples
         --------
-        con.drop_table('my_table', database='operations', force=True)
+        >>> table = 'my_table'
+        >>> db = 'operations'
+        >>> con.drop_table(table, database=db, force=True)  # doctest: +SKIP
         """
         statement = ddl.DropTable(table_name, database=database,
                                   must_exist=not force)
@@ -1160,7 +1149,7 @@ class ImpalaClient(SQLClient):
         except Exception as e:
             try:
                 self.drop_view(name, database=database)
-            except:
+            except Exception:
                 raise e
 
     def cache_table(self, table_name, database=None, pool='default'):
@@ -1176,7 +1165,10 @@ class ImpalaClient(SQLClient):
 
         Examples
         --------
-        con.cache_table('my_table', database='operations', pool='op_4GB_pool')
+        >>> table = 'my_table'
+        >>> db = 'operations'
+        >>> pool = 'op_4GB_pool'
+        >>> con.cache_table('my_table', database=db, pool=pool)  # noqa: E501 # doctest: +SKIP
         """
         statement = ddl.CacheTable(table_name, database=database, pool=pool)
         self._execute(statement)
@@ -1656,6 +1648,9 @@ class ImpalaTable(ir.TableExpr, DatabaseEntity):
         """
         self._client.drop_table_or_view(self._qualified_name)
 
+    def truncate(self):
+        self._client.truncate_table(self._qualified_name)
+
     def insert(self, obj=None, overwrite=False, partition=None,
                values=None, validate=True, results=False):
         """
@@ -1681,10 +1676,10 @@ class ImpalaTable(ir.TableExpr, DatabaseEntity):
 
         Examples
         --------
-        t.insert(table_expr)
+        >>> t.insert(table_expr)  # doctest: +SKIP
 
         # Completely overwrite contents
-        t.insert(table_expr, overwrite=True)
+        >>> t.insert(table_expr, overwrite=True)  # doctest: +SKIP
         """
         if isinstance(obj, pd.DataFrame):
             from ibis.impala.pandas_interop import write_temp_dataframe
@@ -1714,8 +1709,14 @@ class ImpalaTable(ir.TableExpr, DatabaseEntity):
                     _validate_compatible(insert_schema, partless_schema)
 
         if partition is not None:
-            if set(partition_schema.names).intersection(expr.schema().names):
-                expr = expr.drop(partition_schema.names)
+            partition_schema = self.partition_schema()
+            partition_schema_names = frozenset(partition_schema.names)
+            expr = expr.projection([
+                column for column in expr.columns
+                if column not in partition_schema_names
+            ])
+        else:
+            partition_schema = None
 
         ast = build_ast(expr)
         select = ast.queries[0]
@@ -1977,6 +1978,7 @@ def _validate_compatible(from_schema, to_schema):
 def _split_signature(x):
     name, rest = x.split('(', 1)
     return name, rest[:-1]
+
 
 _arg_type = re.compile('(.*)\.\.\.|([^\.]*)')
 

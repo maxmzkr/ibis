@@ -12,21 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import unittest
+
 import pytest
 
 import pandas as pd
+import pandas.util.testing as tm
 
 import ibis
-
-from ibis import literal as L
-from ibis.compat import unittest, StringIO, Decimal
-from ibis.expr.datatypes import Category
-from ibis.expr.tests.mocks import MockConnection
-from ibis.impala.compiler import ImpalaExprTranslator, to_sql, ImpalaContext
-from ibis.sql.tests.test_compiler import ExprTestCases
-from ibis.impala.tests.common import ImpalaE2E
 import ibis.expr.types as ir
 import ibis.expr.api as api
+
+from ibis import literal as L
+from ibis.expr.datatypes import Category
+
+from ibis.compat import StringIO, Decimal
+from ibis.expr.tests.mocks import MockConnection
+
+pytest.importorskip('hdfs')
+pytest.importorskip('sqlalchemy')
+pytest.importorskip('impala.dbapi')
+
+from ibis.impala.compiler import ImpalaExprTranslator, to_sql  # noqa: E402
+from ibis.impala.compiler import ImpalaContext  # noqa: E402
+from ibis.sql.tests.test_compiler import ExprTestCases  # noqa: E402
+from ibis.impala.tests.common import ImpalaE2E  # noqa: E402
 
 
 def approx_equal(a, b, eps):
@@ -210,9 +220,12 @@ class TestValueExprs(unittest.TestCase, ExprSQLTest):
 
     def test_decimal_casts(self):
         cases = [
-            (L('9.9999999').cast('decimal(38,5)'),
-             "CAST('9.9999999' AS decimal(38,5))"),
-            (self.table.f.cast('decimal(12,2)'), "CAST(`f` AS decimal(12,2))")
+            (L('9.9999999').cast('decimal(38, 5)'),
+             "CAST('9.9999999' AS decimal(38, 5))"),
+            (
+                self.table.f.cast('decimal(12, 2)'),
+                "CAST(`f` AS decimal(12, 2))"
+            ),
         ]
         self._check_expr_cases(cases)
 
@@ -379,7 +392,7 @@ class TestUnaryBuiltins(unittest.TestCase, ExprSQLTest):
 
     def test_hash(self):
         expr = self.table.int_col.hash()
-        assert isinstance(expr, ir.Int64Array)
+        assert isinstance(expr, ir.Int64Column)
         assert isinstance(self.table.int_col.sum().hash(),
                           ir.Int64Scalar)
 
@@ -469,7 +482,7 @@ END"""
             (f.nullif(f == 0),
              'nullif(`l_quantity`, `l_quantity` = 0)'),
             (f.fillna(0),
-             'isnull(`l_quantity`, CAST(0 AS decimal(12,2)))'),
+             'isnull(`l_quantity`, CAST(0 AS decimal(12, 2)))'),
         ]
         self._check_expr_cases(cases)
 
@@ -479,10 +492,24 @@ END"""
 
         cases = [
             (f.fillna(0),
-             'isnull(`l_extendedprice`, CAST(0 AS decimal(12,2)))'),
+             'isnull(`l_extendedprice`, CAST(0 AS decimal(12, 2)))'),
             (f.fillna(0.0), 'isnull(`l_extendedprice`, 0.0)'),
         ]
         self._check_expr_cases(cases)
+
+    def test_identical_to(self):
+        t = self.con.table('functional_alltypes')
+        expr = t.tinyint_col.identical_to(t.double_col)
+        result = to_sql(expr)
+        expected = """\
+SELECT `tinyint_col` IS NOT DISTINCT FROM `double_col` AS `tmp`
+FROM functional_alltypes"""
+        assert result == expected
+
+    def test_identical_to_special_case(self):
+        expr = ibis.NA.cast('int64').identical_to(ibis.NA.cast('int64'))
+        result = to_sql(expr)
+        assert result == 'SELECT TRUE AS `tmp`'
 
 
 class TestBucketHistogram(unittest.TestCase, ExprSQLTest):
@@ -782,6 +809,8 @@ class TestAnalyticFunctions(unittest.TestCase, ExprSQLTest):
             (t.double_col.first(), 'first_value(`double_col`)'),
             (t.double_col.last(), 'last_value(`double_col`)'),
             # (t.double_col.nth(4), 'first_value(lag(double_col, 4 - 1))')
+            (t.double_col.ntile(3), 'ntile(3)'),
+            (t.double_col.percent_rank(), 'percent_rank()'),
         ]
         self._check_expr_cases(cases)
 
@@ -824,7 +853,11 @@ class TestStringBuiltins(unittest.TestCase, ExprSQLTest):
 
     def test_like(self):
         cases = [
-            (self.table.string_col.like('foo%'), "`string_col` LIKE 'foo%'")
+            (self.table.string_col.like('foo%'), "`string_col` LIKE 'foo%'"),
+            (
+                self.table.string_col.like(['foo%', '%bar']),
+                "`string_col` LIKE 'foo%' OR `string_col` LIKE '%bar'"
+            )
         ]
         self._check_expr_cases(cases)
 
@@ -973,8 +1006,8 @@ class TestImpalaExprs(ImpalaE2E, unittest.TestCase, ExprTestCases):
         table = self.con.table('tpch_lineitem')
 
         expr = table.l_quantity
-        assert expr._precision == 12
-        assert expr._scale == 2
+        assert expr.meta.precision == 12
+        assert expr.meta.scale == 2
 
         # TODO: what if user impyla version does not have decimal Metadata?
 
@@ -1119,14 +1152,14 @@ class TestImpalaExprs(ImpalaE2E, unittest.TestCase, ExprTestCases):
             return x
 
         left, right = t.schema(), table.schema()
-        for i, (n, l, r) in enumerate(zip(left.names, left.types,
-                                          right.types)):
-            l = _clean_type(l)
-            r = _clean_type(r)
+        for i, (n, left, right) in enumerate(zip(
+                left.names, left.types, right.types)):
+            left = _clean_type(left)
+            right = _clean_type(right)
 
-            if l != r:
+            if left != right:
                 pytest.fail('Value for {0} had left type {1}'
-                            ' and right type {2}'.format(n, l, r))
+                            ' and right type {2}'.format(n, left, right))
 
     def assert_cases_equality(self, cases):
         for expr, expected in cases:
@@ -1199,7 +1232,7 @@ class TestImpalaExprs(ImpalaE2E, unittest.TestCase, ExprTestCases):
 
     def test_decimal_builtins_2(self):
         d = L('5.245')
-        dc = d.cast('decimal(12,5)')
+        dc = d.cast('decimal(12, 5)')
         cases = [
             (dc % 5, Decimal('0.245')),
 
@@ -1421,10 +1454,9 @@ class TestImpalaExprs(ImpalaE2E, unittest.TestCase, ExprTestCases):
             d.var(where=cond),
         ]
 
-        agg_exprs = [expr.name('e%d' % i)
-                     for i, expr in enumerate(exprs)]
+        metrics = [expr.name('e%d' % i) for i, expr in enumerate(exprs)]
 
-        agged_table = table.aggregate(agg_exprs)
+        agged_table = table.aggregate(metrics)
         agged_table.execute()
 
     def test_analytic_functions(self):
@@ -1438,6 +1470,8 @@ class TestImpalaExprs(ImpalaE2E, unittest.TestCase, ExprTestCases):
             f.lead(),
             f.rank(),
             f.dense_rank(),
+            f.percent_rank(),
+            f.ntile(buckets=7),
 
             f.first(),
             f.last(),
@@ -1548,8 +1582,8 @@ FROM functional_alltypes"""
 
         t = self.con.sql(sql)
 
-        assert isinstance(t.varchar_col, api.StringArray)
-        assert isinstance(t.char_col, api.StringArray)
+        assert isinstance(t.varchar_col, api.StringColumn)
+        assert isinstance(t.char_col, api.StringColumn)
 
     def test_unions_with_ctes(self):
         t = self.con.table('functional_alltypes')
@@ -1564,6 +1598,34 @@ FROM functional_alltypes"""
 
         expr = join1.union(join2)
         self.con.explain(expr)
+
+    def test_head(self):
+        t = self.con.table('functional_alltypes')
+        result = t.head().execute()
+        expected = t.limit(5).execute()
+        tm.assert_frame_equal(result, expected)
+
+    def test_identical_to(self):
+        cases = [
+            (ibis.NA.cast('int64'), ibis.NA.cast('int64'), True),
+            (L(1), L(1), True),
+            (ibis.NA.cast('int64'), L(1), False),
+            (L(1), ibis.NA.cast('int64'), False),
+            (L(0), L(1), False),
+            (L(1), L(0), False),
+        ]
+        con = self.con
+        for left, right, expected in cases:
+            expr = left.identical_to(right)
+            result = con.execute(expr)
+            assert result == expected
+
+    def test_not(self):
+        t = self.con.table('functional_alltypes').limit(10)
+        expr = t.projection([(~t.double_col.isnull()).name('double_col')])
+        result = expr.execute().double_col
+        expected = ~t.execute().double_col.isnull()
+        tm.assert_series_equal(result, expected)
 
 
 def test_where_with_timestamp():
@@ -1615,3 +1677,24 @@ FROM (
 ) t0"""
 
     assert result == expected
+
+
+def test_named_from_filter_groupby():
+    t = ibis.table([('key', 'string'), ('value', 'double')], name='t0')
+    gb = t.filter(t.value == 42).groupby(t.key)
+    sum_expr = lambda t: (t.value + 1 + 2 + 3).sum()  # noqa: E731
+    expr = gb.aggregate(abc=sum_expr)
+    expected = """\
+SELECT `key`, sum(((`value` + 1) + 2) + 3) AS `abc`
+FROM t0
+WHERE `value` = 42
+GROUP BY 1"""
+    assert ibis.impala.compile(expr) == expected
+
+    expr = gb.aggregate(foo=sum_expr)
+    expected = """\
+SELECT `key`, sum(((`value` + 1) + 2) + 3) AS `foo`
+FROM t0
+WHERE `value` = 42
+GROUP BY 1"""
+    assert ibis.impala.compile(expr) == expected

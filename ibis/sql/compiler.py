@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from six import StringIO
 from collections import defaultdict
 
 from ibis.compat import lzip
@@ -26,9 +27,6 @@ import ibis.expr.format as format
 import ibis.sql.transforms as transforms
 import ibis.util as util
 import ibis
-
-
-# ---------------------------------------------------------------------
 
 
 class QueryAST(object):
@@ -50,7 +48,7 @@ class SelectBuilder(object):
     relevant query unit aliases to be used when actually generating SQL.
     """
 
-    def __init__(self, expr, context):
+    def __init__(self, expr, context, params):
         self.expr = expr
 
         self.query_expr, self.result_handler = _adapt_expr(self.expr)
@@ -71,6 +69,7 @@ class SelectBuilder(object):
         self.distinct = False
 
         self.op_memo = util.IbisSet()
+        self.params = params
 
     def get_result(self):
         # make idempotent
@@ -119,7 +118,8 @@ class SelectBuilder(object):
                      distinct=self.distinct,
                      result_handler=self.result_handler,
                      parent_expr=self.query_expr,
-                     context=self.context)
+                     context=self.context,
+                     params=self.params)
 
     def _populate_context(self):
         # Populate aliases for the distinct relations used to output this
@@ -182,7 +182,7 @@ class SelectBuilder(object):
 
         unchanged = True
 
-        if isinstance(op, ops.ValueNode):
+        if isinstance(op, ops.ValueOp):
             new_args = []
             for arg in op.args:
                 if isinstance(arg, ir.Expr):
@@ -276,7 +276,7 @@ class SelectBuilder(object):
         elif isinstance(op, (ops.Any, ops.BooleanValueOp,
                              ops.TableColumn, ir.Literal)):
             return expr
-        elif isinstance(op, ops.ValueNode):
+        elif isinstance(op, ops.ValueOp):
             visited = [self._visit_filter(arg)
                        if isinstance(arg, ir.Expr) else arg
                        for arg in op.args]
@@ -418,7 +418,7 @@ class SelectBuilder(object):
 
             self.group_by = self._convert_group_by(sub_op.by)
             self.having = sub_op.having
-            self.select_set = sub_op.by + sub_op.agg_exprs
+            self.select_set = sub_op.by + sub_op.metrics
             self.table_set = sub_op.table
             self.filters = sub_op.predicates
             self.sort_by = sub_op.sort_keys
@@ -544,14 +544,21 @@ class SelectBuilder(object):
 def _get_subtables(expr):
     subtables = []
 
-    def _walk(expr):
-        op = expr.op()
-        if isinstance(op, ops.Join):
-            _walk(op.left)
-            _walk(op.right)
-        else:
-            subtables.append(expr)
-    _walk(expr)
+    stack = [expr]
+    seen = set()
+
+    while stack:
+        e = stack.pop()
+        op = e.op()
+
+        if op not in seen:
+            seen.add(op)
+
+            if isinstance(op, ops.Join):
+                stack.append(op.right)
+                stack.append(op.left)
+            else:
+                subtables.append(e)
 
     return subtables
 
@@ -642,7 +649,7 @@ class _ExtractSubqueries(object):
             self._visit_join(expr)
         elif isinstance(node, ops.PhysicalTable):
             self._visit_physical_table(expr)
-        elif isinstance(node, ops.ValueNode):
+        elif isinstance(node, ops.ValueOp):
             for arg in node.flat_args():
                 if not isinstance(arg, ir.Expr):
                     continue
@@ -861,7 +868,7 @@ def _adapt_expr(expr):
         else:
             raise NotImplementedError(expr._repr())
 
-    elif isinstance(expr, ir.ArrayExpr):
+    elif isinstance(expr, ir.ColumnExpr):
         op = expr.op()
 
         def _get_column(name):
@@ -876,7 +883,7 @@ def _adapt_expr(expr):
             # Something more complicated.
             base_table = L.find_source_table(expr)
 
-            if isinstance(op, ops.DistinctArray):
+            if isinstance(op, ops.DistinctColumn):
                 expr = op.arg
                 try:
                     name = op.arg.get_name()
@@ -900,17 +907,22 @@ class QueryBuilder(object):
 
     select_builder = SelectBuilder
 
-    def __init__(self, expr, context=None):
+    def __init__(self, expr, context=None, params=None):
         self.expr = expr
 
         if context is None:
             context = self._make_context()
 
         self.context = context
+        self.params = params if params is not None else {}
 
     @property
     def _make_context(self):
         raise NotImplementedError
+
+    @property
+    def _union_class(self):
+        return Union
 
     def get_result(self):
         op = self.expr.op()
@@ -928,10 +940,11 @@ class QueryBuilder(object):
         op = self.expr.op()
         return self._union_class(op.left, op.right, self.expr,
                                  distinct=op.distinct,
-                                 context=self.context)
+                                 context=self.context,
+                                 params=self.params)
 
     def _make_select(self):
-        builder = self.select_builder(self.expr, self.context)
+        builder = self.select_builder(self.expr, self.context, self.params)
         return builder.get_result()
 
 
@@ -1096,16 +1109,17 @@ class ExprTranslator(object):
 
     _rewrites = {}
 
-    def __init__(self, expr, context=None, named=False, permit_subquery=False):
+    def __init__(
+        self,
+        expr, context=None, named=False, permit_subquery=False, params=None
+    ):
         self.expr = expr
         self.permit_subquery = permit_subquery
-
-        if context is None:
-            context = self._context_class()
-        self.context = context
+        self.context = self._context_class() if context is None else context
 
         # For now, governing whether the result will have a name
         self.named = named
+        self.params = params
 
     @property
     def _context_class(self):
@@ -1147,7 +1161,7 @@ class ExprTranslator(object):
             op = expr.op()
 
         # TODO: use op MRO for subclasses instead of this isinstance spaghetti
-        if isinstance(op, ir.Parameter):
+        if isinstance(op, ir.ScalarParameter):
             return self._trans_param(expr)
         elif isinstance(op, ops.TableNode):
             # HACK/TODO: revisit for more complex cases
@@ -1156,11 +1170,11 @@ class ExprTranslator(object):
             formatter = self._registry[type(op)]
             return formatter(self, expr)
         else:
-            raise com.TranslationError('No translator rule for {0}'
+            raise com.TranslationError('No translator rule for {}'
                                        .format(type(op)))
 
     def _trans_param(self, expr):
-        raise NotImplementedError
+        return self.params[expr]
 
     @classmethod
     def rewrites(cls, klass, f=None):
@@ -1293,7 +1307,7 @@ class Select(DDL):
                  order_by=None, limit=None,
                  distinct=False, indent=2,
                  result_handler=None, parent_expr=None,
-                 context=None):
+                 context=None, params=None):
         self.context = context
 
         self.select_set = select_set
@@ -1315,18 +1329,19 @@ class Select(DDL):
         self.indent = indent
 
         self.result_handler = result_handler
+        self.params = params
 
     translator = None
 
     def _translate(self, expr, context=None, named=False,
                    permit_subquery=False):
-
         if context is None:
             context = self.context
 
         translator = self.translator(expr, context=context,
                                      named=named,
-                                     permit_subquery=permit_subquery)
+                                     permit_subquery=permit_subquery,
+                                     params=self.params)
         return translator.get_result()
 
     def equals(self, other, cache=None):
@@ -1373,8 +1388,214 @@ class Select(DDL):
 
         return exprs
 
+    def compile(self):
+        """
+        This method isn't yet idempotent; calling multiple times may yield
+        unexpected results
+        """
+        # Can't tell if this is a hack or not. Revisit later
+        self.context.set_query(self)
+
+        # If any subqueries, translate them and add to beginning of query as
+        # part of the WITH section
+        with_frag = self.format_subqueries()
+
+        # SELECT
+        select_frag = self.format_select_set()
+
+        # FROM, JOIN, UNION
+        from_frag = self.format_table_set()
+
+        # WHERE
+        where_frag = self.format_where()
+
+        # GROUP BY and HAVING
+        groupby_frag = self.format_group_by()
+
+        # ORDER BY and LIMIT
+        order_frag = self.format_postamble()
+
+        # Glue together the query fragments and return
+        query = '\n'.join(filter(
+            None,
+            [
+                with_frag,
+                select_frag,
+                from_frag,
+                where_frag,
+                groupby_frag,
+                order_frag,
+            ]
+        ))
+        return query
+
+    def format_subqueries(self):
+        if not self.subqueries:
+            return
+
+        context = self.context
+
+        buf = []
+
+        for i, expr in enumerate(self.subqueries):
+            formatted = util.indent(context.get_compiled_expr(expr), 2)
+            alias = context.get_ref(expr)
+            buf.append('{} AS (\n{}\n)'.format(alias, formatted))
+
+        return 'WITH {}'.format(',\n'.join(buf))
+
+    def format_select_set(self):
+        # TODO:
+        context = self.context
+        formatted = []
+        for expr in self.select_set:
+            if isinstance(expr, ir.ValueExpr):
+                expr_str = self._translate(expr, named=True)
+            elif isinstance(expr, ir.TableExpr):
+                # A * selection, possibly prefixed
+                if context.need_aliases():
+                    alias = context.get_ref(expr)
+
+                    # materialized join will not have an alias. see #491
+                    expr_str = '{}.*'.format(alias) if alias else '*'
+                else:
+                    expr_str = '*'
+            formatted.append(expr_str)
+
+        buf = StringIO()
+        line_length = 0
+        max_length = 70
+        tokens = 0
+        for i, val in enumerate(formatted):
+            # always line-break for multi-line expressions
+            if val.count('\n'):
+                if i:
+                    buf.write(',')
+                buf.write('\n')
+                indented = util.indent(val, self.indent)
+                buf.write(indented)
+
+                # set length of last line
+                line_length = len(indented.split('\n')[-1])
+                tokens = 1
+            elif (tokens > 0 and line_length and
+                  len(val) + line_length > max_length):
+                # There is an expr, and adding this new one will make the line
+                # too long
+                buf.write(',\n       ') if i else buf.write('\n')
+                buf.write(val)
+                line_length = len(val) + 7
+                tokens = 1
+            else:
+                if i:
+                    buf.write(',')
+                buf.write(' ')
+                buf.write(val)
+                tokens += 1
+                line_length += len(val) + 2
+
+        if self.distinct:
+            select_key = 'SELECT DISTINCT'
+        else:
+            select_key = 'SELECT'
+
+        return '{}{}'.format(select_key, buf.getvalue())
+
+    @property
+    def table_set_formatter(self):
+        return TableSetFormatter
+
+    def format_table_set(self):
+        if self.table_set is None:
+            return None
+
+        fragment = 'FROM '
+
+        helper = self.table_set_formatter(self, self.table_set)
+        fragment += helper.get_result()
+
+        return fragment
+
+    def format_group_by(self):
+        if not len(self.group_by):
+            # There is no aggregation, nothing to see here
+            return None
+
+        lines = []
+        if len(self.group_by) > 0:
+            clause = 'GROUP BY {}'.format(', '.join([
+                str(x + 1) for x in self.group_by]))
+            lines.append(clause)
+
+        if len(self.having) > 0:
+            trans_exprs = []
+            for expr in self.having:
+                translated = self._translate(expr)
+                trans_exprs.append(translated)
+            lines.append('HAVING {}'.format(' AND '.join(trans_exprs)))
+
+        return '\n'.join(lines)
+
+    def format_where(self):
+        if not self.where:
+            return None
+
+        buf = StringIO()
+        buf.write('WHERE ')
+        fmt_preds = []
+        for pred in self.where:
+            new_pred = self._translate(pred, permit_subquery=True)
+            if isinstance(pred.op(), ops.Or):
+                # parens for OR exprs because it binds looser than AND
+                new_pred = '({})'.format(new_pred)
+            fmt_preds.append(new_pred)
+
+        conj = ' AND\n{}'.format(' ' * 6)
+        buf.write(conj.join(fmt_preds))
+        return buf.getvalue()
+
+    def format_postamble(self):
+        buf = StringIO()
+        lines = 0
+
+        if len(self.order_by) > 0:
+            buf.write('ORDER BY ')
+            formatted = []
+            for expr in self.order_by:
+                key = expr.op()
+                translated = self._translate(key.expr)
+                if not key.ascending:
+                    translated += ' DESC'
+                formatted.append(translated)
+            buf.write(', '.join(formatted))
+            lines += 1
+
+        if self.limit is not None:
+            if lines:
+                buf.write('\n')
+            n, offset = self.limit['n'], self.limit['offset']
+            buf.write('LIMIT {}'.format(n))
+            if offset is not None and offset != 0:
+                buf.write(' OFFSET {}'.format(offset))
+            lines += 1
+
+        if not lines:
+            return None
+
+        return buf.getvalue()
+
 
 class TableSetFormatter(object):
+
+    _join_names = {
+        ops.InnerJoin: 'INNER JOIN',
+        ops.LeftJoin: 'LEFT OUTER JOIN',
+        ops.RightJoin: 'RIGHT OUTER JOIN',
+        ops.OuterJoin: 'FULL OUTER JOIN',
+        ops.LeftAntiJoin: 'LEFT ANTI JOIN',
+        ops.LeftSemiJoin: 'LEFT SEMI JOIN',
+        ops.CrossJoin: 'CROSS JOIN'
+    }
 
     def __init__(self, parent, expr, indent=2):
         self.parent = parent
@@ -1434,13 +1655,129 @@ class TableSetFormatter(object):
                                            'i.e. non-equijoins, are not '
                                            'supported')
 
+    def _get_join_type(self, op):
+        return self._join_names[type(op)]
+
+    def _quote_identifier(self, name):
+        return name
+
+    def _format_table(self, expr):
+        # TODO: This could probably go in a class and be significantly nicer
+        ctx = self.context
+
+        ref_expr = expr
+        op = ref_op = expr.op()
+        if isinstance(op, ops.SelfReference):
+            ref_expr = op.table
+            ref_op = ref_expr.op()
+
+        if isinstance(ref_op, ops.PhysicalTable):
+            name = ref_op.name
+            if name is None:
+                raise com.RelationError('Table did not have a name: {0!r}'
+                                        .format(expr))
+            result = self._quote_identifier(name)
+            is_subquery = False
+        else:
+            # A subquery
+            if ctx.is_extracted(ref_expr):
+                # Was put elsewhere, e.g. WITH block, we just need to grab its
+                # alias
+                alias = ctx.get_ref(expr)
+
+                # HACK: self-references have to be treated more carefully here
+                if isinstance(op, ops.SelfReference):
+                    return '{} {}'.format(ctx.get_ref(ref_expr), alias)
+                else:
+                    return alias
+
+            subquery = ctx.get_compiled_expr(expr)
+            result = '(\n{}\n)'.format(util.indent(subquery, self.indent))
+            is_subquery = True
+
+        if is_subquery or ctx.need_aliases():
+            result += ' {}'.format(ctx.get_ref(expr))
+
+        return result
+
+    def get_result(self):
+        # Got to unravel the join stack; the nesting order could be
+        # arbitrary, so we do a depth first search and push the join tokens
+        # and predicates onto a flat list, then format them
+        op = self.expr.op()
+
+        if isinstance(op, ops.Join):
+            self._walk_join_tree(op)
+        else:
+            self.join_tables.append(self._format_table(self.expr))
+
+        # TODO: Now actually format the things
+        buf = StringIO()
+        buf.write(self.join_tables[0])
+        for jtype, table, preds in zip(self.join_types, self.join_tables[1:],
+                                       self.join_predicates):
+            buf.write('\n')
+            buf.write(util.indent('{} {}'.format(jtype, table), self.indent))
+
+            if len(preds):
+                buf.write('\n')
+                fmt_preds = [self._translate(pred) for pred in preds]
+                conj = ' AND\n{}'.format(' ' * 3)
+                fmt_preds = util.indent('ON ' + conj.join(fmt_preds),
+                                        self.indent * 2)
+                buf.write(fmt_preds)
+
+        return buf.getvalue()
+
 
 class Union(DDL):
 
-    def __init__(self, left_table, right_table, expr, distinct=False, context=None):
+    def __init__(self, left_table, right_table, expr, distinct=False,
+                 context=None, params=None):
         self.context = context
         self.left = left_table
         self.right = right_table
         self.distinct = distinct
         self.table_set = expr
         self.filters = []
+        self.params = params
+
+    def _extract_subqueries(self):
+        self.subqueries = _extract_subqueries(self)
+        for subquery in self.subqueries:
+            self.context.set_extracted(subquery)
+
+    def format_subqueries(self):
+        context = self.context
+        subqueries = self.subqueries
+
+        return ',\n'.join([
+            '{} AS (\n{}\n)'.format(
+                context.get_ref(expr),
+                util.indent(context.get_compiled_expr(expr), 2)
+            ) for expr in subqueries
+        ])
+
+    def format_relation(self, expr):
+        ref = self.context.get_ref(expr)
+        if ref is not None:
+            return 'SELECT *\nFROM {}'.format(ref)
+        return self.context.get_compiled_expr(expr)
+
+    def compile(self):
+        union_keyword = 'UNION' if self.distinct else 'UNION ALL'
+
+        self._extract_subqueries()
+
+        left_set = self.format_relation(self.left)
+        right_set = self.format_relation(self.right)
+        extracted = self.format_subqueries()
+
+        buf = []
+
+        if extracted:
+            buf.append('WITH {}'.format(extracted))
+
+        buf.extend([left_set, union_keyword, right_set])
+
+        return '\n'.join(buf)

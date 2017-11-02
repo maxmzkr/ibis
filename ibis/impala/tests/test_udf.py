@@ -11,24 +11,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import unittest
 from posixpath import join as pjoin
 import pytest
+import pandas as pd
 
 import ibis
 
 import ibis.expr.types as ir
 
-from ibis.impala import ddl
-import ibis.impala as api
-
 from ibis.common import IbisTypeError
-from ibis.compat import unittest, Decimal
+from ibis.compat import Decimal
 from ibis.expr.datatypes import validate_type
 from ibis.expr.tests.mocks import MockConnection
-from ibis.impala.tests.common import ImpalaE2E
+
 import ibis.expr.rules as rules
 import ibis.common as com
 import ibis.util as util
+
+pytest.importorskip('hdfs')
+pytest.importorskip('sqlalchemy')
+pytest.importorskip('impala.dbapi')
+
+from ibis.impala import ddl  # noqa: E402
+import ibis.impala as api  # noqa: E402
+from ibis.impala.tests.common import ImpalaE2E  # noqa: E402
 
 
 class TestWrapping(unittest.TestCase):
@@ -85,9 +92,9 @@ class TestWrapping(unittest.TestCase):
             ibis_type = validate_type(t)
 
             expr = func(sv)
-            assert type(expr) == ibis_type.scalar_type()
+            assert type(expr) == type(ibis_type.scalar_type()(expr.op()))  # noqa: E501, E721
             expr = func(av)
-            assert type(expr) == ibis_type.array_type()
+            assert type(expr) == type(ibis_type.array_type()(expr.op()))  # noqa: E501, E721
 
     def test_uda_primitive_output_types(self):
         types = [
@@ -108,15 +115,17 @@ class TestWrapping(unittest.TestCase):
 
             expr1 = func(sv)
             expr2 = func(sv)
-            assert isinstance(expr1, ibis_type.scalar_type())
-            assert isinstance(expr2, ibis_type.scalar_type())
+            expected_type1 = type(ibis_type.scalar_type()(expr1.op()))
+            expected_type2 = type(ibis_type.scalar_type()(expr2.op()))
+            assert isinstance(expr1, expected_type1)
+            assert isinstance(expr2, expected_type2)
 
     def test_decimal(self):
         func = self._register_udf(['decimal(9,0)'], 'decimal(9,0)', 'test')
         expr = func(1.0)
         assert type(expr) == ir.DecimalScalar
         expr = func(self.dec)
-        assert type(expr) == ir.DecimalArray
+        assert type(expr) == ir.DecimalColumn
 
     def test_udf_invalid_typecasting(self):
         cases = [
@@ -150,7 +159,7 @@ class TestWrapping(unittest.TestCase):
                                   'int64', 'mult_types')
 
         expr = func(self.i32, self.d, self.s, self.b, self.t)
-        assert issubclass(type(expr), ir.ArrayExpr)
+        assert issubclass(type(expr), ir.ColumnExpr)
 
         expr = func(1, 1.0, 'a', True, ibis.timestamp('1961-04-10'))
         assert issubclass(type(expr), ir.ScalarExpr)
@@ -173,6 +182,11 @@ class TestUDFE2E(ImpalaE2E, unittest.TestCase):
         self.udf_ll = pjoin(self.test_data_dir, 'udf/udf-sample.ll')
         self.uda_ll = pjoin(self.test_data_dir, 'udf/uda-sample.ll')
         self.uda_so = pjoin(self.test_data_dir, 'udf/libudasample.so')
+        self.con.disable_codegen(False)
+
+    def tearDown(self):
+        super(TestUDFE2E, self).tearDown()
+        self.con.disable_codegen(True)
 
     @pytest.mark.udf
     def test_identity_primitive_types(self):
@@ -209,7 +223,7 @@ class TestUDFE2E(ImpalaE2E, unittest.TestCase):
         assert result == Decimal(1)
 
         expr = func(col)
-        assert issubclass(type(expr), ir.ArrayExpr)
+        assert issubclass(type(expr), ir.ColumnExpr)
         self.con.execute(expr)
 
     @pytest.mark.udf
@@ -221,11 +235,11 @@ class TestUDFE2E(ImpalaE2E, unittest.TestCase):
         func = self._udf_creation_to_op(name, symbol, inputs, output)
 
         expr = func(self.alltypes.int_col, 1)
-        assert issubclass(type(expr), ir.ArrayExpr)
+        assert issubclass(type(expr), ir.ColumnExpr)
         self.con.execute(expr)
 
         expr = func(1, self.alltypes.int_col)
-        assert issubclass(type(expr), ir.ArrayExpr)
+        assert issubclass(type(expr), ir.ColumnExpr)
         self.con.execute(expr)
 
         expr = func(self.alltypes.int_col, self.alltypes.tinyint_col)
@@ -247,8 +261,7 @@ class TestUDFE2E(ImpalaE2E, unittest.TestCase):
         result = self.con.execute(expr)
         # Hacky
         if datatype is 'timestamp':
-            import pandas as pd
-            assert type(result) == pd.tslib.Timestamp
+            assert type(result) == pd.Timestamp
         else:
             lop = literal.op()
             if isinstance(lop, ir.Literal):
@@ -257,7 +270,7 @@ class TestUDFE2E(ImpalaE2E, unittest.TestCase):
                 self.assertAlmostEqual(result, self.con.execute(literal), 5)
 
         expr = func(column)
-        assert issubclass(type(expr), ir.ArrayExpr)
+        assert issubclass(type(expr), ir.ColumnExpr)
         self.con.execute(expr)
 
     @pytest.mark.udf

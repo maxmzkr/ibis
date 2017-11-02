@@ -23,7 +23,6 @@ import ibis.util as util
 import ibis.compat as compat
 import ibis
 
-
 GLOBAL_TMP_DB = os.environ.get('IBIS_TEST_TMP_DB',
                                '__ibis_tmp_{0}'.format(util.guid()))
 
@@ -58,6 +57,7 @@ class IbisTestEnv(object):
                                                 'True').lower() == 'true'
         self.auth_mechanism = os.environ.get('IBIS_TEST_AUTH_MECH', 'NOSASL')
         self.llvm_config = os.environ.get('IBIS_TEST_LLVM_CONFIG', None)
+        self.webhdfs_user = os.environ.get('IBIS_TEST_WEBHDFS_USER', None)
 
     def __repr__(self):
         kvs = ['{0}={1}'.format(k, v)
@@ -76,7 +76,8 @@ def connect_test(env, with_hdfs=True):
                                         port=env.webhdfs_port,
                                         auth_mechanism=env.auth_mechanism,
                                         verify=(env.auth_mechanism
-                                                not in ['GSSAPI', 'LDAP']))
+                                                not in ['GSSAPI', 'LDAP']),
+                                        user=env.webhdfs_user)
     else:
         hdfs_client = None
 
@@ -116,12 +117,7 @@ class ImpalaE2E(object):
         cls.test_data_db = env.test_data_db
         cls.tmp_dir = env.tmp_dir
         cls.tmp_db = env.tmp_db
-
-        try:
-            cls.alltypes = cls.con.table('functional_alltypes')
-        except:
-            pass
-
+        cls.alltypes = cls.con.table('functional_alltypes')
         cls.db = cls.con.database(env.test_data_db)
 
         if not cls.con.exists_database(cls.tmp_db):
@@ -138,13 +134,14 @@ class ImpalaE2E(object):
             # reduce test flakiness
             try:
                 cls.con.drop_database(cls.tmp_db, force=True)
-                break
-            except:
+            except Exception:
                 i += 1
                 if i >= retries:
                     raise
 
                 time.sleep(0.1)
+            else:
+                break
 
     def setUp(self):
         self.temp_databases = []
