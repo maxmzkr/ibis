@@ -42,8 +42,6 @@ def _post_process_group_by_order_by(series, index):
 
 @execute_first.register(ops.WindowOp, pd.DataFrame)
 def execute_frame_window_op(op, data, scope=None, context=None, **kwargs):
-    import ipdb;ipdb.set_trace()
-
     operand, window = op.args
 
     following = window.following
@@ -201,10 +199,6 @@ def execute_series_dense_rank(op, data, **kwargs):
     # TODO(phillipc): Handle ORDER BY
     # Things I need, row order, column order, item to order by
     return data.rank(method='dense', ascending=True)
-
-
-@execute_node.register(ops.DenseRank, (pd.DataFrame, GroupBy))
-def execute_seri
 
 
 @execute_node.register(ops.PercentRank, (pd.Series, SeriesGroupBy))

@@ -43,6 +43,12 @@ def execute_limit_frame(op, data, limit, offset, **kwargs):
     return data.iloc[offset:offset + limit]
 
 
+@execute_node.register(ops.Cast, SeriesGroupBy, dt.DataType)
+def execute_cast_series_group_by(op, data, type, **kwargs):
+    result = execute_node(op, data.obj, type, **kwargs)
+    return result.groupby(data.grouper.groupings)
+
+
 @execute_node.register(ops.Cast, pd.Series, dt.DataType)
 def execute_cast_series_generic(op, data, type, **kwargs):
     return data.astype(constants.IBIS_TYPE_TO_PANDAS_TYPE[type])
@@ -781,3 +787,18 @@ def execute_array_collect_group_by(op, data, **kwargs):
 @execute_node.register(ops.SelfReference, pd.DataFrame)
 def execute_node_self_reference_dataframe(op, data, **kwargs):
     return data
+
+
+@execute_node.register(ir.ValueList)
+def execute_node_value_list(op, **kwargs):
+    return [execute(arg, **kwargs) for arg in op.values]
+
+
+@execute_node.register(ops.Contains, pd.Series, list)
+def execute_node_contains_series_list(op, data, elements, **kwargs):
+    return data.isin(elements)
+
+
+@execute_node.register(ops.NotContains, pd.Series, list)
+def execute_node_not_contains_series_list(op, data, elements, **kwargs):
+    return ~data.isin(elements)

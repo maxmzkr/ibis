@@ -634,3 +634,50 @@ def test_scalar_parameter(t, df, raw_value):
     result = expr.execute(params={value: raw_value})
     expected = df.float64_with_zeros == raw_value
     tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    'elements',
+    [
+        [1],
+        (1,),
+        pytest.mark.xfail({1}, raises=TypeError, reason='Not yet implemented'),
+        pytest.mark.xfail(
+            frozenset({1}), raises=TypeError, reason='Not yet implemented'
+        ),
+    ]
+)
+def test_isin(t, df, elements):
+    expr = t.plain_float64.isin(elements)
+    expected = df.plain_float64.isin(elements)
+    result = expr.execute()
+    tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    'elements',
+    [
+        [1],
+        (1,),
+        pytest.mark.xfail({1}, raises=TypeError, reason='Not yet implemented'),
+        pytest.mark.xfail(
+            frozenset({1}), raises=TypeError, reason='Not yet implemented'
+        ),
+    ]
+)
+def test_notin(t, df, elements):
+    expr = t.plain_float64.notin(elements)
+    expected = ~df.plain_float64.isin(elements)
+    result = expr.execute()
+    tm.assert_series_equal(result, expected)
+
+
+def test_cast_on_group_by(t, df):
+    expr = t.groupby(t.dup_strings).aggregate(
+        casted=(t.float64_with_zeros == 0).cast('int64').sum()
+    )
+    result = expr.execute()
+    expected = df.groupby('dup_strings').float64_with_zeros.apply(
+        lambda s: (s == 0).astype('int64').sum()
+    ).reset_index().rename(columns={'float64_with_zeros': 'casted'})
+    tm.assert_frame_equal(result, expected)

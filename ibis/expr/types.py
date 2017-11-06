@@ -648,11 +648,11 @@ def param(type, name=None):
     return expr.name(name)
 
 
-def distinct_roots(*args):
-    all_roots = []
-    for arg in args:
-        all_roots.extend(arg._root_tables())
-    return list(toolz.unique(all_roots, key=id))
+def distinct_roots(*expressions):
+    roots = toolz.concat(
+        expression._root_tables() for expression in expressions
+    )
+    return list(toolz.unique(roots, key=id))
 
 
 # ---------------------------------------------------------------------
@@ -1582,8 +1582,8 @@ class ValueList(ValueOp):
     """
 
     def __init__(self, args):
-        self.values = [as_value_expr(x) for x in args]
-        ValueOp.__init__(self, self.values)
+        self.values = list(map(as_value_expr, args))
+        super(ValueList, self).__init__(self.values)
 
     def root_tables(self):
         return distinct_roots(*self.values)
