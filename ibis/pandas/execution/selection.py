@@ -322,12 +322,21 @@ def execute_selection_dataframe(op, data, scope=None, **kwargs):
                 selection, op, data, scope=scope, **kwargs
             )
 
+            if not isinstance(pandas_object, pd.DataFrame) and not isinstance(pandas_object, pd.Series):
+                # was a sacalar
+                pandas_object = pd.Series(data=[pandas_object]*len(data))
+
             if isinstance(pandas_object, pd.Series):
-                pandas_object = pandas_object.rename(
-                    getattr(selection, '_name', pandas_object.name)
-                )
+                pandas_object = pandas_object.copy()
+                pandas_object.name = getattr(selection, '_name', pandas_object.name)
+
             data_pieces.append(pandas_object)
-        result = pd.concat(data_pieces, axis=1)
+        try:
+            result = pd.concat(data_pieces, axis=1)
+        except:
+            import ipdb;ipdb.set_trace()
+            raise
+
 
     if predicates:
         predicates = _compute_predicates(

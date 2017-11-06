@@ -9,7 +9,7 @@ from collections import OrderedDict
 import toolz
 
 import pandas as pd
-from pandas.core.groupby import SeriesGroupBy
+from pandas.core.groupby import SeriesGroupBy, GroupBy
 
 import ibis.expr.types as ir
 import ibis.expr.operations as ops
@@ -42,6 +42,8 @@ def _post_process_group_by_order_by(series, index):
 
 @execute_first.register(ops.WindowOp, pd.DataFrame)
 def execute_frame_window_op(op, data, scope=None, context=None, **kwargs):
+    import ipdb;ipdb.set_trace()
+
     operand, window = op.args
 
     following = window.following
@@ -197,7 +199,12 @@ def execute_series_min_rank(op, data, **kwargs):
 @execute_node.register(ops.DenseRank, (pd.Series, SeriesGroupBy))
 def execute_series_dense_rank(op, data, **kwargs):
     # TODO(phillipc): Handle ORDER BY
+    # Things I need, row order, column order, item to order by
     return data.rank(method='dense', ascending=True)
+
+
+@execute_node.register(ops.DenseRank, (pd.DataFrame, GroupBy))
+def execute_seri
 
 
 @execute_node.register(ops.PercentRank, (pd.Series, SeriesGroupBy))

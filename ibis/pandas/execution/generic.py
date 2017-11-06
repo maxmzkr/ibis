@@ -31,6 +31,9 @@ from ibis.pandas.execution import constants
 @execute_node.register(ir.Literal)
 @execute_node.register(ir.Literal, object)
 @execute_node.register(ir.Literal, object, dt.DataType)
+@execute_node.register(ir.NullLiteral)
+@execute_node.register(ir.NullLiteral, object)
+@execute_node.register(ir.NullLiteral, object, dt.DataType)
 def execute_node_literal(op, *args, **kwargs):
     return op.value
 
@@ -210,6 +213,16 @@ def execute_cast_datetime_to_integer(op, data, type, **kwargs):
 def execute_cast_timestamp_to_integer(op, data, type, **kwargs):
     """Cast timestamps to integers"""
     return data.value
+
+
+@execute_node.register(ops.Cast, type(None), dt.Int64)
+def execute_cast_none_to_int64(op, data, type, **kwargs):
+    return None
+
+
+@execute_node.register(ops.Cast, type(None), dt.Int32)
+def execute_cast_none_to_int32(op, data, type, **kwargs):
+    return None
 
 
 @execute_node.register(
@@ -678,9 +691,14 @@ def execute_series_distinct(op, data, **kwargs):
     return pd.Series(data.unique(), name=data.name)
 
 
-@execute_node.register(ops.Union, pd.DataFrame, pd.DataFrame)
+@execute_node.register(ops.Union, pd.DataFrame, pd.DataFrame, )
 def execute_union_dataframe_dataframe(op, left, right, **kwargs):
     return pd.concat([left, right], axis=0)
+
+
+@execute_node.register(ops.Union, pd.DataFrame, pd.DataFrame, bool)
+def execute_union_dataframe_dataframe(op, left, right, distinct, **kwargs):
+    return pd.concat([left, right], axis=0).drop_duplicates()
 
 
 @execute_node.register(ops.IsNull, pd.Series)

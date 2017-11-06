@@ -74,9 +74,15 @@ integer_types = six.integer_types + (np.integer,)
 try:
     from pandas.api.types import DatetimeTZDtype  # noqa: F401
 except ImportError:
-    from pandas.types.dtypes import DatetimeTZDtype  # noqa: F401
+    try:
+        from pandas.types.dtypes import DatetimeTZDtype  # noqa: F401
+    except ImportError:
+        from pandas.core.dtypes import DatetimeTZDtype
 
 try:
     from pandas.core.tools.datetimes import to_time  # noqa: F401
 except ImportError:
-    from pandas.tseries.tools import to_time  # noqa: F401
+    try:
+        from pandas.tseries.tools import to_time  # noqa: F401
+    except:
+        to_time = None
